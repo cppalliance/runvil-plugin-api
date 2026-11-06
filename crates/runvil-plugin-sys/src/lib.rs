@@ -13,6 +13,11 @@
 //!
 //! - Every call passes an [`RvCall`] that names a verb. Loading returns the
 //!   Plugin's instance pointer, and every later call passes it back.
+//! - [`RvHost`] holds only what is true on every call: the contract version
+//!   the Host speaks. Each function a Plugin may call back belongs to one
+//!   verb and sits in that verb's arguments struct, behind `call->args`,
+//!   beside the `ctx` pointer it takes first. For [`RV_PLUGIN_LOAD`] that
+//!   struct is [`RvLoadArgs`].
 //! - Strings are a pointer plus a length, UTF-8, not NUL-terminated.
 //! - Verb names follow `RV_<OBJECT>_<ACTION>`. Libraries open and close;
 //!   Plugins load and unload.
@@ -21,20 +26,26 @@
 //!
 //! - [`RV_API_MAJOR`] and [`RV_API_MINOR`] name the contract's version, and
 //!   the `runvil-plugin-sys` crate's version is the same number.
-//! - Version 0.1 makes no compatibility promise. Each 0.x version is a
-//!   contract of its own, and a Plugin built for one loads only in a Host
-//!   whose [`RvHost`] reports exactly that version.
+//! - A 0.x version makes no compatibility promise. Each one is a contract
+//!   of its own, and a Plugin built for one loads only in a Host whose
+//!   [`RvHost`] reports exactly that version.
 //! - From 1.0, a minor version only adds: a field at the end of a struct,
-//!   whose `size` field shows that it is there, a function at the end of
-//!   [`RvHost`], or a verb. A Plugin built for 1.n loads in a Host that
-//!   reports major version 1 and a minor version of at least n.
+//!   such as a function at the end of a verb's arguments struct, whose
+//!   `size` field shows that it is there, or a verb with an arguments
+//!   struct of its own. A Plugin built for 1.n loads in a Host that reports
+//!   major version 1 and a minor version of at least n.
 //!
 //! # Threads and lifetime
 //!
-//! - [`RV_PLUGIN_LOAD`] runs on the thread of the insert call. Each
-//!   [`RvHost`] function answers only the [`RvCall`] it was handed, only
-//!   while that load call runs, and only on its thread. Any other use,
-//!   including during [`RV_PLUGIN_UNLOAD`], returns [`RV_ERR_MISUSE`].
+//! - [`RV_PLUGIN_LOAD`] runs on the thread of the insert call. The
+//!   functions in its [`RvLoadArgs`] answer only while that call runs, only
+//!   on its thread, and only for its `ctx`. Any other use, including during
+//!   [`RV_PLUGIN_UNLOAD`], returns [`RV_ERR_MISUSE`].
+//! - The Host keeps each `ctx` valid while the Plugin is loaded, until
+//!   [`RV_PLUGIN_UNLOAD`] returns, so a late call through it is answered
+//!   [`RV_ERR_MISUSE`] instead of reaching freed memory. The `ctx` of a load
+//!   the loader rejects is gone once that load returns, and the Plugin must
+//!   not use it.
 //! - [`RV_PLUGIN_UNLOAD`] may come on any thread, because the last holder
 //!   of the Plugin drops it. The instance must be freeable from a thread
 //!   other than the one that loaded it.
@@ -53,20 +64,21 @@
 //!
 //! Verbs 3 to 8 are reserved for later versions, so their numbers never
 //! change. Each one gets its own arguments struct behind `call->args`, so
-//! no verb reads fields meant for another. No constants are declared for
-//! them yet.
+//! no verb reads fields meant for another, and that struct holds the
+//! functions the verb may call back, under the verb's own lifetime and
+//! thread rules. No constants are declared for them yet.
 //!
 //! - `RV_PACK_NEW` (3): make one Pack's per-run instance and set
 //!   `call->pack_run`.
 //! - `RV_PACK_DELETE` (4): free that per-run instance.
 //! - `RV_TOOL_CALL` (5): start one tool call, which finishes later through
-//!   an [`RvHost`] function.
+//!   a function in its arguments struct, callable after the verb returns.
 //! - `RV_TOOL_CANCEL` (6): abandon a started call.
 //! - `RV_PRELUDE_INSTALL` (7): install the Pack's native prelude, once per
 //!   Lua VM.
 //! - `RV_PACK_RENDER` (8): render the tools a section offered from one
-//!   Pack for one model, which finishes later through an [`RvHost`]
-//!   function.
+//!   Pack for one model, which finishes later through a function in its
+//!   arguments struct.
 //!
 //! # Status codes
 //!
@@ -115,7 +127,7 @@ pub const RV_PLUGIN_UNLOAD: RvVerb = 2;
 /// The contract's major version, which [`RvHost`] reports.
 pub const RV_API_MAJOR: u32 = 0;
 /// The contract's minor version, which [`RvHost`] reports.
-pub const RV_API_MINOR: u32 = 1;
+pub const RV_API_MINOR: u32 = 2;
 
 /// A UTF-8 string that is not NUL-terminated.
 #[repr(C)]
@@ -142,7 +154,9 @@ pub struct RvPluginInfo {
     pub version: RvStr,
 }
 
-/// The functions a Plugin may call back during a call.
+/// What the Host reports on every call: the contract version it speaks.
+/// The functions a Plugin may call back sit in each verb's arguments
+/// struct instead.
 #[repr(C)]
 #[derive(Debug)]
 pub struct RvHost {
@@ -154,13 +168,26 @@ pub struct RvHost {
     pub api_minor: u32,
     /// Zero.
     pub reserved: u32,
-    /// Declines the load, at most once, on the thread running the load call,
-    /// with a UTF-8 reason of at most 1024 bytes; returns
-    /// [`RV_ERR_REFUSED`].
-    pub refuse: unsafe extern "C" fn(*const RvCall, RvStr) -> RvStatus,
-    /// Names the Plugin, exactly once, during [`RV_PLUGIN_LOAD`] and on the
-    /// thread running the load call.
-    pub describe_plugin: unsafe extern "C" fn(*const RvCall, *const RvPluginInfo) -> RvStatus,
+}
+
+/// The arguments of [`RV_PLUGIN_LOAD`]: the functions the Plugin may call
+/// while it loads, each taking `ctx` first.
+#[repr(C)]
+#[derive(Debug)]
+pub struct RvLoadArgs {
+    /// `size_of::<RvLoadArgs>()`; in C, `sizeof(RvLoadArgs)`.
+    pub size: u32,
+    /// Zero.
+    pub reserved: u32,
+    /// The Host's context for this load, passed back as the first argument
+    /// of each function below. The Plugin never reads through it.
+    pub ctx: *mut c_void,
+    /// Declines the load, at most once, with a UTF-8 reason of at most 1024
+    /// bytes; returns [`RV_ERR_REFUSED`].
+    pub refuse: unsafe extern "C" fn(ctx: *mut c_void, reason: RvStr) -> RvStatus,
+    /// Names the Plugin, exactly once.
+    pub describe_plugin:
+        unsafe extern "C" fn(ctx: *mut c_void, info: *const RvPluginInfo) -> RvStatus,
 }
 
 /// One call into a Plugin's entry point.
@@ -171,14 +198,15 @@ pub struct RvCall {
     pub size: u32,
     /// The operation.
     pub verb: RvVerb,
-    /// The functions the Plugin may call during this call.
+    /// What the Host reports on every call.
     pub host: *const RvHost,
     /// The Plugin instance: NULL going into [`RV_PLUGIN_LOAD`], which may
     /// set it.
     pub plugin: *mut c_void,
-    /// The per-run Pack instance; always NULL in version 0.1.
+    /// The per-run Pack instance; NULL until the Pack verbs exist.
     pub pack_run: *mut c_void,
-    /// The verb's own arguments; NULL for both version 0.1 verbs.
+    /// The verb's own arguments: an [`RvLoadArgs`] for [`RV_PLUGIN_LOAD`],
+    /// and NULL for [`RV_PLUGIN_UNLOAD`].
     pub args: *const c_void,
 }
 
@@ -202,7 +230,7 @@ mod tests {
         RV_PLUGIN_LOAD, RV_PLUGIN_UNLOAD,
     };
     #[cfg(target_pointer_width = "64")]
-    use super::{RvCall, RvHost, RvPluginInfo, RvStr};
+    use super::{RvCall, RvHost, RvLoadArgs, RvPluginInfo, RvStr};
 
     #[test]
     #[cfg(target_pointer_width = "64")]
@@ -224,14 +252,23 @@ mod tests {
 
     #[test]
     #[cfg(target_pointer_width = "64")]
-    fn the_host_table_keeps_its_layout() {
-        assert_eq!(size_of::<RvHost>(), 32);
+    fn the_host_keeps_its_layout() {
+        assert_eq!(size_of::<RvHost>(), 16);
         assert_eq!(offset_of!(RvHost, size), 0);
         assert_eq!(offset_of!(RvHost, api_major), 4);
         assert_eq!(offset_of!(RvHost, api_minor), 8);
         assert_eq!(offset_of!(RvHost, reserved), 12);
-        assert_eq!(offset_of!(RvHost, refuse), 16);
-        assert_eq!(offset_of!(RvHost, describe_plugin), 24);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn the_load_arguments_keep_their_layout() {
+        assert_eq!(size_of::<RvLoadArgs>(), 32);
+        assert_eq!(offset_of!(RvLoadArgs, size), 0);
+        assert_eq!(offset_of!(RvLoadArgs, reserved), 4);
+        assert_eq!(offset_of!(RvLoadArgs, ctx), 8);
+        assert_eq!(offset_of!(RvLoadArgs, refuse), 16);
+        assert_eq!(offset_of!(RvLoadArgs, describe_plugin), 24);
     }
 
     #[test]

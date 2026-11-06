@@ -18,6 +18,11 @@
  *
  * - Every call passes an `RvCall` that names a verb. Loading returns the
  *   Plugin's instance pointer, and every later call passes it back.
+ * - `RvHost` holds only what is true on every call: the contract version
+ *   the Host speaks. Each function a Plugin may call back belongs to one
+ *   verb and sits in that verb's arguments struct, behind `call->args`,
+ *   beside the `ctx` pointer it takes first. For `RV_PLUGIN_LOAD` that
+ *   struct is `RvLoadArgs`.
  * - Strings are a pointer plus a length, UTF-8, not NUL-terminated.
  * - Verb names follow `RV_<OBJECT>_<ACTION>`. Libraries open and close;
  *   Plugins load and unload.
@@ -26,20 +31,26 @@
  *
  * - `RV_API_MAJOR` and `RV_API_MINOR` name the contract's version, and
  *   the `runvil-plugin-sys` crate's version is the same number.
- * - Version 0.1 makes no compatibility promise. Each 0.x version is a
- *   contract of its own, and a Plugin built for one loads only in a Host
- *   whose `RvHost` reports exactly that version.
+ * - A 0.x version makes no compatibility promise. Each one is a contract
+ *   of its own, and a Plugin built for one loads only in a Host whose
+ *   `RvHost` reports exactly that version.
  * - From 1.0, a minor version only adds: a field at the end of a struct,
- *   whose `size` field shows that it is there, a function at the end of
- *   `RvHost`, or a verb. A Plugin built for 1.n loads in a Host that
- *   reports major version 1 and a minor version of at least n.
+ *   such as a function at the end of a verb's arguments struct, whose
+ *   `size` field shows that it is there, or a verb with an arguments
+ *   struct of its own. A Plugin built for 1.n loads in a Host that reports
+ *   major version 1 and a minor version of at least n.
  *
  * # Threads and lifetime
  *
- * - `RV_PLUGIN_LOAD` runs on the thread of the insert call. Each
- *   `RvHost` function answers only the `RvCall` it was handed, only
- *   while that load call runs, and only on its thread. Any other use,
- *   including during `RV_PLUGIN_UNLOAD`, returns `RV_ERR_MISUSE`.
+ * - `RV_PLUGIN_LOAD` runs on the thread of the insert call. The
+ *   functions in its `RvLoadArgs` answer only while that call runs, only
+ *   on its thread, and only for its `ctx`. Any other use, including during
+ *   `RV_PLUGIN_UNLOAD`, returns `RV_ERR_MISUSE`.
+ * - The Host keeps each `ctx` valid while the Plugin is loaded, until
+ *   `RV_PLUGIN_UNLOAD` returns, so a late call through it is answered
+ *   `RV_ERR_MISUSE` instead of reaching freed memory. The `ctx` of a load
+ *   the loader rejects is gone once that load returns, and the Plugin must
+ *   not use it.
  * - `RV_PLUGIN_UNLOAD` may come on any thread, because the last holder
  *   of the Plugin drops it. The instance must be freeable from a thread
  *   other than the one that loaded it.
@@ -58,20 +69,21 @@
  *
  * Verbs 3 to 8 are reserved for later versions, so their numbers never
  * change. Each one gets its own arguments struct behind `call->args`, so
- * no verb reads fields meant for another. No constants are declared for
- * them yet.
+ * no verb reads fields meant for another, and that struct holds the
+ * functions the verb may call back, under the verb's own lifetime and
+ * thread rules. No constants are declared for them yet.
  *
  * - `RV_PACK_NEW` (3): make one Pack's per-run instance and set
  *   `call->pack_run`.
  * - `RV_PACK_DELETE` (4): free that per-run instance.
  * - `RV_TOOL_CALL` (5): start one tool call, which finishes later through
- *   an `RvHost` function.
+ *   a function in its arguments struct, callable after the verb returns.
  * - `RV_TOOL_CANCEL` (6): abandon a started call.
  * - `RV_PRELUDE_INSTALL` (7): install the Pack's native prelude, once per
  *   Lua VM.
  * - `RV_PACK_RENDER` (8): render the tools a section offered from one
- *   Pack for one model, which finishes later through an `RvHost`
- *   function.
+ *   Pack for one model, which finishes later through a function in its
+ *   arguments struct.
  *
  * # Status codes
  *
@@ -93,6 +105,7 @@
 typedef struct RvStr RvStr;
 typedef struct RvPluginInfo RvPluginInfo;
 typedef struct RvHost RvHost;
+typedef struct RvLoadArgs RvLoadArgs;
 typedef struct RvCall RvCall;
 
 /**
@@ -103,7 +116,7 @@ typedef struct RvCall RvCall;
 /**
  * The contract's minor version, which `RvHost` reports.
  */
-#define RV_API_MINOR 1
+#define RV_API_MINOR 2
 
 /**
  * What every function in the contract returns: zero for success.
@@ -154,38 +167,9 @@ struct RvPluginInfo {
 };
 
 /**
- * One call into a Plugin's entry point.
- */
-struct RvCall {
-  /**
-   * `size_of::<RvCall>()`; in C, `sizeof(RvCall)`.
-   */
-  uint32_t size;
-  /**
-   * The operation.
-   */
-  RvVerb verb;
-  /**
-   * The functions the Plugin may call during this call.
-   */
-  const struct RvHost *host;
-  /**
-   * The Plugin instance: NULL going into `RV_PLUGIN_LOAD`, which may
-   * set it.
-   */
-  void *plugin;
-  /**
-   * The per-run Pack instance; always NULL in version 0.1.
-   */
-  void *pack_run;
-  /**
-   * The verb's own arguments; NULL for both version 0.1 verbs.
-   */
-  const void *args;
-};
-
-/**
- * The functions a Plugin may call back during a call.
+ * What the Host reports on every call: the contract version it speaks.
+ * The functions a Plugin may call back sit in each verb's arguments
+ * struct instead.
  */
 struct RvHost {
   /**
@@ -204,17 +188,67 @@ struct RvHost {
    * Zero.
    */
   uint32_t reserved;
+};
+
+/**
+ * The arguments of `RV_PLUGIN_LOAD`: the functions the Plugin may call
+ * while it loads, each taking `ctx` first.
+ */
+struct RvLoadArgs {
   /**
-   * Declines the load, at most once, on the thread running the load call,
-   * with a UTF-8 reason of at most 1024 bytes; returns
-   * `RV_ERR_REFUSED`.
+   * `size_of::<RvLoadArgs>()`; in C, `sizeof(RvLoadArgs)`.
    */
-  RvStatus (*refuse)(const struct RvCall*, struct RvStr);
+  uint32_t size;
   /**
-   * Names the Plugin, exactly once, during `RV_PLUGIN_LOAD` and on the
-   * thread running the load call.
+   * Zero.
    */
-  RvStatus (*describe_plugin)(const struct RvCall*, const struct RvPluginInfo*);
+  uint32_t reserved;
+  /**
+   * The Host's context for this load, passed back as the first argument
+   * of each function below. The Plugin never reads through it.
+   */
+  void *ctx;
+  /**
+   * Declines the load, at most once, with a UTF-8 reason of at most 1024
+   * bytes; returns `RV_ERR_REFUSED`.
+   */
+  RvStatus (*refuse)(void *ctx, struct RvStr reason);
+  /**
+   * Names the Plugin, exactly once.
+   */
+  RvStatus (*describe_plugin)(void *ctx, const struct RvPluginInfo *info);
+};
+
+/**
+ * One call into a Plugin's entry point.
+ */
+struct RvCall {
+  /**
+   * `size_of::<RvCall>()`; in C, `sizeof(RvCall)`.
+   */
+  uint32_t size;
+  /**
+   * The operation.
+   */
+  RvVerb verb;
+  /**
+   * What the Host reports on every call.
+   */
+  const struct RvHost *host;
+  /**
+   * The Plugin instance: NULL going into `RV_PLUGIN_LOAD`, which may
+   * set it.
+   */
+  void *plugin;
+  /**
+   * The per-run Pack instance; NULL until the Pack verbs exist.
+   */
+  void *pack_run;
+  /**
+   * The verb's own arguments: an `RvLoadArgs` for `RV_PLUGIN_LOAD`,
+   * and NULL for `RV_PLUGIN_UNLOAD`.
+   */
+  const void *args;
 };
 
 /**

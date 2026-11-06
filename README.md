@@ -21,10 +21,10 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-runvil-plugin-sdk = { git = "https://github.com/cppalliance/runvil-plugin-api", tag = "api-v0.1.0" }
+runvil-plugin-sdk = { git = "https://github.com/cppalliance/runvil-plugin-api", tag = "api-v0.2.0" }
 
 [dev-dependencies]
-runvil-plugin-sdk = { git = "https://github.com/cppalliance/runvil-plugin-api", tag = "api-v0.1.0", features = ["test-support"] }
+runvil-plugin-sdk = { git = "https://github.com/cppalliance/runvil-plugin-api", tag = "api-v0.2.0", features = ["test-support"] }
 ```
 
 `src/lib.rs`:
@@ -61,11 +61,11 @@ A Host can also link a Plugin crate in and hand `runvil_plugin_sdk::entry::<Acme
 
 ## Writing a Plugin in C or C++
 
-Include `runvil_plugin.h` and define `RvStatus runvil_plugin(RvCall *call)`. The header's opening comment is the whole contract: the verbs, who calls what on which thread, and what the Plugin must free on every path. `tests/c-layout` compiles the header as C99 and as C++ on every CI run.
+Include `runvil_plugin.h` and define `RvStatus runvil_plugin(RvCall *call)`. The header's opening comment is the whole contract: the verbs, who calls what on which thread, and what the Plugin must free on every path. The functions a Plugin may call back come with the verb they serve, in its arguments struct behind `call->args` (an `RvLoadArgs` for `RV_PLUGIN_LOAD`), and each takes that struct's `ctx` first. `tests/c-layout` compiles the header as C99 and as C++ on every CI run.
 
 ## Versions
 
-The contract's version is `RV_API_MAJOR`.`RV_API_MINOR`, and `runvil-plugin-sys` carries the same version number. While the major version is 0, each version is its own contract, so a Plugin built for 0.1 loads only in a Host that speaks exactly 0.1. From 1.0, minor versions only add, and a Plugin built for 1.n loads in any Host that speaks 1.n or later.
+The contract's version is `RV_API_MAJOR`.`RV_API_MINOR`, and `runvil-plugin-sys` carries the same version number. While the major version is 0, each version is its own contract, so a Plugin built for 0.2 loads only in a Host that speaks exactly 0.2. From 1.0, minor versions only add, and a Plugin built for 1.n loads in any Host that speaks 1.n or later.
 
 Cargo allows one package per `links` value in a build, and `runvil-plugin-sys` sets `links = "runvil_plugin"`, so a Host can never link two versions of the contract into one binary.
 

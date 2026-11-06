@@ -22,7 +22,8 @@ mod tests {
 
     use runvil_plugin_sys::{
         RV_API_MAJOR, RV_API_MINOR, RV_ERR_MISUSE, RV_ERR_REFUSED, RV_ERR_UNSUPPORTED, RV_OK,
-        RV_PLUGIN_LOAD, RV_PLUGIN_UNLOAD, RvCall, RvHost, RvPluginInfo, RvStatus, RvStr, RvVerb,
+        RV_PLUGIN_LOAD, RV_PLUGIN_UNLOAD, RvCall, RvHost, RvLoadArgs, RvPluginInfo, RvStatus,
+        RvStr, RvVerb,
     };
 
     /// One entry of the table in `layout.c`.
@@ -89,10 +90,20 @@ mod tests {
             ("offsetof(RvHost, api_major)", offset_of!(RvHost, api_major)),
             ("offsetof(RvHost, api_minor)", offset_of!(RvHost, api_minor)),
             ("offsetof(RvHost, reserved)", offset_of!(RvHost, reserved)),
-            ("offsetof(RvHost, refuse)", offset_of!(RvHost, refuse)),
+            ("sizeof(RvLoadArgs)", size_of::<RvLoadArgs>()),
+            ("offsetof(RvLoadArgs, size)", offset_of!(RvLoadArgs, size)),
             (
-                "offsetof(RvHost, describe_plugin)",
-                offset_of!(RvHost, describe_plugin),
+                "offsetof(RvLoadArgs, reserved)",
+                offset_of!(RvLoadArgs, reserved),
+            ),
+            ("offsetof(RvLoadArgs, ctx)", offset_of!(RvLoadArgs, ctx)),
+            (
+                "offsetof(RvLoadArgs, refuse)",
+                offset_of!(RvLoadArgs, refuse),
+            ),
+            (
+                "offsetof(RvLoadArgs, describe_plugin)",
+                offset_of!(RvLoadArgs, describe_plugin),
             ),
             ("sizeof(RvCall)", size_of::<RvCall>()),
             ("offsetof(RvCall, size)", offset_of!(RvCall, size)),
