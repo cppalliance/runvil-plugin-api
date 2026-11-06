@@ -1,0 +1,19 @@
+[package]
+name = "c-layout"
+version = "0.0.0"
+description = "Compiles runvil_plugin.h as C and as C++ and checks both against the Rust mirror"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# A normal dependency, so this crate's build script receives the header's
+# directory as `DEP_RUNVIL_PLUGIN_INCLUDE`.
+[dependencies]
+runvil-plugin-sys.workspace = true
+
+[build-dependencies]
+cc.workspace = true
+
+[lints]
+workspace = true

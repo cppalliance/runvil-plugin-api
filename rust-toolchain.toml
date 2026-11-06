@@ -1,0 +1,5 @@
+# Build and test on a pinned stable release, matching CI. The two published
+# crates also build on their `rust-version`, which CI's msrv job checks.
+[toolchain]
+channel = "1.99"
+components = ["rustfmt", "clippy"]

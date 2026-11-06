@@ -1,0 +1,50 @@
+[workspace]
+resolver = "3"
+members = ["crates/*", "tests/c-layout", "examples/*"]
+
+[workspace.package]
+edition = "2024"
+license = "BSL-1.0"
+repository = "https://github.com/cppalliance/runvil-plugin-api"
+
+[workspace.dependencies]
+runvil-plugin-sys = { path = "crates/runvil-plugin-sys" }
+runvil-plugin-sdk = { path = "crates/runvil-plugin-sdk" }
+# Generates `runvil_plugin.h` for `cargo xtask header`. default-features off
+# drops the `clap` command line, which the xtask does not use.
+cbindgen = { version = "0.29", default-features = false }
+# Compiles the header as C and as C++ for the layout check.
+cc = "1"
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+unsafe_op_in_unsafe_fn = "deny"
+future_incompatible = { level = "warn", priority = -1 }
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "deny"
+private_intra_doc_links = "deny"
+unescaped_backticks = "deny"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+dbg_macro = "warn"
+todo = "deny"
+undocumented_unsafe_blocks = "deny"
+missing_safety_doc = "deny"
+allow_attributes = "deny"
+allow_attributes_without_reason = "deny"
+exit = "deny"
+disallowed_methods = "deny"
+disallowed_types = "deny"
+disallowed_macros = "deny"
+# Cherry-picked out of pedantic: it flags product names (Runvil, OpenAI) in
+# prose, which reads worse backticked than the lint is worth.
+doc_markdown = "allow"

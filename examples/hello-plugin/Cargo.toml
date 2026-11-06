@@ -1,0 +1,28 @@
+[package]
+name = "hello-plugin"
+version = "0.1.0"
+description = "The smallest library Plugin: it loads, names itself, and unloads"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# A dynamic library for a Host's Plugin directory, and an rlib, so a Host
+# can also link the Plugin in with `dll` off.
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+runvil-plugin-sdk.workspace = true
+
+[dev-dependencies]
+runvil-plugin-sdk = { workspace = true, features = ["test-support"] }
+
+[features]
+default = ["dll"]
+# Exports `runvil_plugin`. A Host that links this crate in turns it off,
+# because two linked Plugins exporting the symbol cannot share one binary.
+dll = []
+
+[lints]
+workspace = true

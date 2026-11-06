@@ -1,0 +1,45 @@
+# How `cargo xtask header` turns `src/lib.rs` into `include/runvil_plugin.h`.
+# The xtask adds three things itself, so no list here is kept by hand: the
+# crate docs as the opening comment, ahead of `header`; one
+# `typedef struct X X;` per struct, as `after_includes`; and every struct
+# in `[export] include`, because cbindgen otherwise emits only structs an
+# exported function names, and this crate exports none.
+
+language = "C"
+no_includes = true
+sys_includes = ["stddef.h", "stdint.h"]
+usize_is_size_t = true
+# Structs are defined by tag (`struct RvCall { ... };`) after the forward
+# typedefs, so `RvHost` can name `RvCall` before its definition, as C needs.
+style = "tag"
+sort_by = "None"
+documentation = true
+documentation_style = "doxy"
+# The include guard is written by hand across `header` and `trailer`,
+# because cbindgen closes its own guard before the trailer, which would
+# leave the declaration of `runvil_plugin` outside it.
+header = """
+#ifndef RUNVIL_PLUGIN_H
+#define RUNVIL_PLUGIN_H"""
+trailer = """
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+/**
+ * The one symbol a library Plugin exports. A linked Plugin has the same
+ * shape under a name of its own crate's choosing. It must not unwind.
+ */
+RvStatus runvil_plugin(RvCall *call);
+
+#ifdef __cplusplus
+}  /* extern "C" */
+#endif
+
+#endif  /* RUNVIL_PLUGIN_H */"""
+
+[export]
+# The header declares `runvil_plugin` itself instead of the entry type, so
+# a C Plugin gets no global name beyond the contract's own `Rv` and `RV_`
+# names.
+exclude = ["PluginEntry"]

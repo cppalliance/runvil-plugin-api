@@ -1,0 +1,14 @@
+[package]
+name = "build-xtask"
+version = "0.0.0"
+description = "Automation for this repository: cargo xtask header"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+cbindgen.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,22 @@
+[package]
+name = "runvil-plugin-sys"
+# The contract's version: `RV_API_MAJOR`.`RV_API_MINOR`, which a unit test
+# checks.
+version = "0.1.0"
+description = "The C contract of a runvil Plugin, runvil_plugin.h, and its raw Rust mirror"
+edition.workspace = true
+# The floor a Plugin author's toolchain needs; CI's msrv job builds it.
+rust-version = "1.85"
+license.workspace = true
+repository.workspace = true
+publish = false
+# Hands dependents' build scripts the header's directory as
+# `DEP_RUNVIL_PLUGIN_INCLUDE`. Cargo also allows one package per `links`
+# value in a build, so one binary can never hold two versions of the
+# contract.
+links = "runvil_plugin"
+
+# No `[dependencies]` of any kind: the contract needs nothing.
+
+[lints]
+workspace = true

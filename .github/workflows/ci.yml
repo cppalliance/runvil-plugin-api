@@ -1,0 +1,89 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Format
+        run: cargo fmt --all --check
+
+  clippy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Clippy
+        env:
+          CARGO_BUILD_WARNINGS: deny
+        run: cargo clippy --locked --workspace --all-targets --all-features
+
+  # The layout check compiles the header with each platform's own C and C++
+  # compilers, so the tests run on all three.
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Test
+        run: cargo test --locked --workspace --all-features
+
+      - name: Build the example library Plugin
+        run: cargo build --locked -p hello-plugin --release
+
+      # No build or test step may write into the repository, the header
+      # included; catch a regression here rather than in a diff.
+      - name: Clean tree
+        shell: bash
+        run: |
+          if [ -n "$(git status --porcelain)" ]; then
+            echo "the build dirtied the repository:"
+            git status --porcelain
+            exit 1
+          fi
+
+  docs:
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+
+      - name: Docs
+        run: cargo doc --locked --workspace --no-deps --all-features
+
+  # The oldest toolchain a Plugin author may build the two published crates
+  # with, their `rust-version`.
+  msrv:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install 1.85
+        run: rustup toolchain install 1.85 --profile minimal
+
+      - name: Check
+        run: cargo +1.85 check --locked -p runvil-plugin-sys -p runvil-plugin-sdk --all-features

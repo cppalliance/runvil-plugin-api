@@ -1,0 +1,21 @@
+[package]
+name = "runvil-plugin-sdk"
+version = "0.1.0"
+description = "Write a runvil Plugin in safe Rust, over runvil-plugin-sys"
+edition.workspace = true
+# The floor a Plugin author's toolchain needs; CI's msrv job builds it.
+rust-version = "1.85"
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+runvil-plugin-sys.workspace = true
+
+[features]
+# `testing`, a fake Host for a Plugin crate's own tests; Plugin crates
+# enable it from `[dev-dependencies]` only.
+test-support = []
+
+[lints]
+workspace = true

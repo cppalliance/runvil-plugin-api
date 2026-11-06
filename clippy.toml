@@ -1,0 +1,13 @@
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+
+# Size limits sit on functions. A file has no length limit.
+too-many-lines-threshold = 100
+too-many-arguments-threshold = 7
+
+# A Plugin shares its process with the Host, so it never installs
+# process-global state. No entry names a `replacement`, because no
+# alternative takes the same arguments and returns the same value.
+disallowed-methods = [
+    { path = "std::panic::set_hook", reason = "use a returned error instead, because the panic hook is process-global state that a Plugin shares with its Host" },
+]

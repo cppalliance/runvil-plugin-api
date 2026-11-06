@@ -1,0 +1,4 @@
+* text=auto eol=lf
+# The header is compared byte for byte against what `cargo xtask header`
+# writes (LF); a checkout must not rewrite it.
+*.h text eol=lf
