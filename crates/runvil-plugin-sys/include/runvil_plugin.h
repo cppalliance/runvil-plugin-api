@@ -16,16 +16,138 @@
  *
  * # The contract
  *
- * - Every call passes an `RvCall` that names a verb. Loading returns the
- *   Plugin's instance pointer, and every later call passes it back.
+ * - Every call passes an `RvCall` that names a verb. The call carries
+ *   three pointers that belong to the Plugin, which the Host stores and
+ *   passes back and never reads through: `plugin`, the Plugin instance;
+ *   `pack_run`, one run's instance of a Pack; and `tool_call`, the state
+ *   one tool call keeps between its steps.
  * - `RvHost` holds only what is true on every call: the contract version
  *   the Host speaks. Each function a Plugin may call back belongs to one
  *   verb and sits in that verb's arguments struct, behind `call->args`,
- *   beside the `ctx` pointer it takes first. For `RV_PLUGIN_LOAD` that
- *   struct is `RvLoadArgs`.
+ *   beside the `ctx` pointer it takes first.
  * - Strings are a pointer plus a length, UTF-8, not NUL-terminated.
+ * - A struct or a string that one side passes to the other is valid only
+ *   until the function it was passed to returns. The receiver copies what
+ *   it keeps.
  * - Verb names follow `RV_<OBJECT>_<ACTION>`. Libraries open and close;
  *   Plugins load and unload.
+ *
+ * # Verbs
+ *
+ * - `RV_PLUGIN_LOAD` (1), with an `RvLoadArgs`: makes the Plugin
+ *   instance and sets `call->plugin`, names the Plugin once with
+ *   `describe_plugin`, and inserts each of the Plugin's Packs with
+ *   `insert_pack`.
+ * - `RV_PLUGIN_UNLOAD` (2), with no arguments: frees `call->plugin`.
+ * - `RV_PACK_NEW` (3), with an `RvPackNewArgs`: makes one run's
+ *   instance of a Pack and sets `call->pack_run`, and lists that
+ *   instance's tools with `add_tool`.
+ * - `RV_PACK_DELETE` (4), with no arguments: frees `call->pack_run`.
+ * - `RV_TOOL_CALL` (5), with an `RvToolCallArgs`: runs one step of a
+ *   tool call on `call->pack_run`.
+ * - `RV_TOOL_CANCEL` (6), with no arguments: frees `call->tool_call`,
+ *   the state of a tool call the Host has abandoned.
+ *
+ * A Plugin answers a verb it does not know with `RV_ERR_UNSUPPORTED`.
+ *
+ * # Packs
+ *
+ * - A Plugin inserts each of its Packs once, while it loads. The Host
+ *   makes one instance of a Pack for each run that holds the Pack, with
+ *   `RV_PACK_NEW`, and frees the instance with `RV_PACK_DELETE` when
+ *   the run ends.
+ * - An instance's tools are the ones it adds during `RV_PACK_NEW`, and
+ *   they stay fixed for the run. The Host forms each tool's id from the
+ *   Pack's id, which is the second segment of the Pack's name, and the
+ *   tool's name: the tool `fetch` of the Pack `acme/url` is `url/fetch`.
+ * - `RV_PACK_NEW` runs while the Host prepares a run, so it returns
+ *   promptly: it does not block and does no I/O. What is costly to make
+ *   belongs in the Plugin instance, which every run shares.
+ *
+ * # Tool calls
+ *
+ * - A tool call is a series of steps. The Host starts the call by sending
+ *   `RV_TOOL_CALL` with `call->tool_call` NULL, and that step may set
+ *   `call->tool_call` to state of its own. A step that returns
+ *   `RV_PENDING` asks for another step: the Host sends `RV_TOOL_CALL`
+ *   again with the same `tool`, the same `arguments`, and the
+ *   `call->tool_call` the last step left.
+ * - A step ends the call by calling `finish` once and returning
+ *   `RV_OK`. Any return other than `RV_PENDING` ends the call, and a
+ *   call that ends without a result fails.
+ * - The Host may abandon a call between two steps, for example when its
+ *   run is canceled. It then sends `RV_TOOL_CANCEL` once, with the
+ *   `call->tool_call` the last step left, and no further step.
+ * - A step does a bounded slice of work and returns. A step that works
+ *   for long, or blocks, stalls its run, and a run can be canceled only
+ *   between steps. `RV_PENDING` is not a way to wait: the Host sends the
+ *   next step as soon as the run's other work has had a turn.
+ *
+ * # Threads and lifetime
+ *
+ * - `RV_PLUGIN_LOAD` runs on the thread of the insert call. Every other
+ *   verb may come on any thread, and the steps of one tool call may come
+ *   on different threads.
+ * - Calls may run at the same time on different threads, with three
+ *   exceptions. No two calls that name the same `tool_call` run at the
+ *   same time. `RV_PACK_DELETE` comes after every tool call of its
+ *   `pack_run` has ended, and runs beside no call that names it.
+ *   `RV_PLUGIN_UNLOAD` comes after every Pack instance of the Plugin is
+ *   deleted, and runs beside no other call.
+ * - The functions in a verb's arguments struct answer only while that
+ *   call runs, only on its thread, and only for its `ctx`. Any other use
+ *   returns `RV_ERR_MISUSE`, and so does a function called against its
+ *   own rules, such as `describe_plugin` called twice. A misuse during a
+ *   call fails that call, whatever status the Plugin returns.
+ * - The Host keeps the `ctx` of a load valid while the Plugin is loaded,
+ *   until `RV_PLUGIN_UNLOAD` returns, so a late call through it is
+ *   answered `RV_ERR_MISUSE` instead of reaching freed memory. The `ctx`
+ *   of a load the Host rejects, and the `ctx` of every other call, is
+ *   gone once the call returns, and the Plugin must not use it.
+ * - `RV_PLUGIN_UNLOAD` must stop every thread the Plugin started and
+ *   release everything it holds before it returns. A library Plugin's
+ *   library closes right after, and a thread still running crashes the
+ *   process.
+ *
+ * # What the Plugin frees
+ *
+ * - A load the Host rejects gets no `RV_PLUGIN_UNLOAD`: a refusal, a
+ *   misuse, a status other than `RV_OK`, or no description. The Plugin
+ *   frees whatever it made before it returns on every such path. A load
+ *   that succeeds is unloaded later, even if the Host then drops the
+ *   Plugin, for example because its name repeats one already loaded.
+ * - An `RV_PACK_NEW` the Host rejects gets no `RV_PACK_DELETE`: a
+ *   refusal, a misuse, or a status other than `RV_OK`. The Plugin frees
+ *   whatever it made before it returns on every such path. One that
+ *   succeeds gets exactly one `RV_PACK_DELETE`.
+ * - The step that ends a tool call frees the call's state before it
+ *   returns. A call that is abandoned gets `RV_TOOL_CANCEL` instead,
+ *   which frees the state; its `call->tool_call` is NULL when no step set
+ *   it. Each call gets one or the other, never both.
+ *
+ * # Reserved verbs
+ *
+ * Verbs 7 and 8 are reserved for later versions, so their numbers never
+ * change. Each one gets its own arguments struct behind `call->args`. No
+ * constants are declared for them yet.
+ *
+ * - `RV_PRELUDE_INSTALL` (7): install the Pack's native prelude, once per
+ *   Lua VM.
+ * - `RV_PACK_RENDER` (8): render the tools a section offered from one
+ *   Pack for one model.
+ *
+ * # Status codes
+ *
+ * - `RV_OK` (0) is success.
+ * - Codes 1 to 3 are reserved for the Lua API's own errors: Lua raised an
+ *   error, a fatal error such as the memory limit or a cancel, and a wrong
+ *   type.
+ * - `RV_ERR_MISUSE` (4) means the caller broke the contract.
+ * - `RV_ERR_REFUSED` (5) means the Plugin declined: to load, or to make
+ *   a Pack instance.
+ * - `RV_ERR_UNSUPPORTED` (6) means the Plugin doesn't know the verb.
+ * - `RV_PENDING` (7) means a tool call needs another step. Only
+ *   `RV_TOOL_CALL` returns it.
  *
  * # Versions
  *
@@ -39,61 +161,6 @@
  *   `size` field shows that it is there, or a verb with an arguments
  *   struct of its own. A Plugin built for 1.n loads in a Host that reports
  *   major version 1 and a minor version of at least n.
- *
- * # Threads and lifetime
- *
- * - `RV_PLUGIN_LOAD` runs on the thread of the insert call. The
- *   functions in its `RvLoadArgs` answer only while that call runs, only
- *   on its thread, and only for its `ctx`. Any other use, including during
- *   `RV_PLUGIN_UNLOAD`, returns `RV_ERR_MISUSE`.
- * - The Host keeps each `ctx` valid while the Plugin is loaded, until
- *   `RV_PLUGIN_UNLOAD` returns, so a late call through it is answered
- *   `RV_ERR_MISUSE` instead of reaching freed memory. The `ctx` of a load
- *   the loader rejects is gone once that load returns, and the Plugin must
- *   not use it.
- * - `RV_PLUGIN_UNLOAD` may come on any thread, because the last holder
- *   of the Plugin drops it. The instance must be freeable from a thread
- *   other than the one that loaded it.
- * - `RV_PLUGIN_UNLOAD` must stop every thread the Plugin started and
- *   release everything it holds before it returns. A library Plugin's
- *   library closes right after, and a thread still running crashes the
- *   process.
- * - A load call the loader rejects gets no `RV_PLUGIN_UNLOAD`: a
- *   refusal, a recorded misuse, a non-OK status, or no description, even
- *   when the Plugin returned `RV_OK`. The Plugin frees whatever it made
- *   before returning on every such path. A load call that succeeds is
- *   unloaded later, even if the loader then drops the Plugin, for example
- *   because its name repeats one already loaded.
- *
- * # Reserved verbs
- *
- * Verbs 3 to 8 are reserved for later versions, so their numbers never
- * change. Each one gets its own arguments struct behind `call->args`, so
- * no verb reads fields meant for another, and that struct holds the
- * functions the verb may call back, under the verb's own lifetime and
- * thread rules. No constants are declared for them yet.
- *
- * - `RV_PACK_NEW` (3): make one Pack's per-run instance and set
- *   `call->pack_run`.
- * - `RV_PACK_DELETE` (4): free that per-run instance.
- * - `RV_TOOL_CALL` (5): start one tool call, which finishes later through
- *   a function in its arguments struct, callable after the verb returns.
- * - `RV_TOOL_CANCEL` (6): abandon a started call.
- * - `RV_PRELUDE_INSTALL` (7): install the Pack's native prelude, once per
- *   Lua VM.
- * - `RV_PACK_RENDER` (8): render the tools a section offered from one
- *   Pack for one model, which finishes later through a function in its
- *   arguments struct.
- *
- * # Status codes
- *
- * - `RV_OK` (0) is success.
- * - Codes 1 to 3 are reserved for the Lua API's own errors: Lua raised an
- *   error, a fatal error such as the memory limit or a cancel, and a wrong
- *   type.
- * - `RV_ERR_MISUSE` (4) means the caller broke the contract.
- * - `RV_ERR_REFUSED` (5) means the Plugin declined to load.
- * - `RV_ERR_UNSUPPORTED` (6) means the Plugin doesn't know the verb.
  */
 
 #ifndef RUNVIL_PLUGIN_H
@@ -104,8 +171,13 @@
 
 typedef struct RvStr RvStr;
 typedef struct RvPluginInfo RvPluginInfo;
+typedef struct RvPackInfo RvPackInfo;
+typedef struct RvToolInfo RvToolInfo;
+typedef struct RvToolResult RvToolResult;
 typedef struct RvHost RvHost;
 typedef struct RvLoadArgs RvLoadArgs;
+typedef struct RvPackNewArgs RvPackNewArgs;
+typedef struct RvToolCallArgs RvToolCallArgs;
 typedef struct RvCall RvCall;
 
 /**
@@ -116,7 +188,7 @@ typedef struct RvCall RvCall;
 /**
  * The contract's minor version, which `RvHost` reports.
  */
-#define RV_API_MINOR 2
+#define RV_API_MINOR 3
 
 /**
  * What every function in the contract returns: zero for success.
@@ -130,11 +202,17 @@ typedef uint32_t RvStatus;
 typedef uint32_t RvVerb;
 
 /**
+ * How a tool call ended, in an `RvToolResult`. A fixed-width integer,
+ * as `RvVerb` is.
+ */
+typedef uint32_t RvResultKind;
+
+/**
  * A UTF-8 string that is not NUL-terminated.
  */
 struct RvStr {
   /**
-   * The first byte.
+   * The first byte. It may be NULL when `len` is zero.
    */
   const char *ptr;
   /**
@@ -157,13 +235,91 @@ struct RvPluginInfo {
   uint32_t reserved;
   /**
    * 1 to 64 bytes of lowercase ASCII letters, digits, `-`, `_`, and `.`:
-   * one Pack id segment, such as `acme-url`.
+   * one name segment, such as `acme-url`.
    */
   struct RvStr name;
   /**
    * Non-empty, at most 64 bytes, with no control characters.
    */
   struct RvStr version;
+};
+
+/**
+ * What a Plugin tells `insert_pack` about one of its Packs.
+ */
+struct RvPackInfo {
+  /**
+   * `size_of::<RvPackInfo>()`; in C, `sizeof(RvPackInfo)`.
+   */
+  uint32_t size;
+  /**
+   * Zero.
+   */
+  uint32_t reserved;
+  /**
+   * The Pack's name: a vendor and a Pack id joined by `/`, such as
+   * `acme/url`. Each is one name segment, as a Plugin's name is.
+   */
+  struct RvStr name;
+  /**
+   * One line saying what the Pack offers: at most 1024 bytes with no
+   * control characters. It may be empty.
+   */
+  struct RvStr description;
+};
+
+/**
+ * What a Pack instance tells `add_tool` about one of its tools.
+ */
+struct RvToolInfo {
+  /**
+   * `size_of::<RvToolInfo>()`; in C, `sizeof(RvToolInfo)`.
+   */
+  uint32_t size;
+  /**
+   * Zero.
+   */
+  uint32_t reserved;
+  /**
+   * The tool's name within its Pack: one name segment, such as `fetch`.
+   */
+  struct RvStr name;
+  /**
+   * The name a model calls the tool by: 1 to 64 bytes of ASCII letters,
+   * digits, `_`, and `-`. Empty lets the Host derive it from the tool's
+   * id, as `url_fetch` from `url/fetch`.
+   */
+  struct RvStr wire_name;
+  /**
+   * What the tool does, for a model to read: non-empty, at most 65536
+   * bytes.
+   */
+  struct RvStr description;
+  /**
+   * The tool's parameters: the JSON text of a JSON Schema whose value is
+   * an object, at most 65536 bytes.
+   */
+  struct RvStr parameters;
+};
+
+/**
+ * How a tool call ended, which a step tells `finish`.
+ */
+struct RvToolResult {
+  /**
+   * `size_of::<RvToolResult>()`; in C, `sizeof(RvToolResult)`.
+   */
+  uint32_t size;
+  /**
+   * Whether the call succeeded, and if so how far its text is trusted,
+   * or else why it failed: one of the `RV_RESULT_` constants.
+   */
+  RvResultKind kind;
+  /**
+   * The call's output when it succeeded, and otherwise a message a model
+   * can read that says what went wrong: at most 16777216 bytes.
+   */
+  struct RvStr text;
 };
 
 /**
@@ -217,6 +373,81 @@ struct RvLoadArgs {
    * Names the Plugin, exactly once.
    */
   RvStatus (*describe_plugin)(void *ctx, const struct RvPluginInfo *info);
+  /**
+   * Inserts one Pack, once for each Pack the Plugin offers. No two
+   * Packs of one Plugin share a name.
+   */
+  RvStatus (*insert_pack)(void *ctx, const struct RvPackInfo *info);
+};
+
+/**
+ * The arguments of `RV_PACK_NEW`: the Pack to make an instance of, and
+ * the functions the Plugin may call while it makes one, each taking `ctx`
+ * first.
+ */
+struct RvPackNewArgs {
+  /**
+   * `size_of::<RvPackNewArgs>()`; in C, `sizeof(RvPackNewArgs)`.
+   */
+  uint32_t size;
+  /**
+   * Zero.
+   */
+  uint32_t reserved;
+  /**
+   * The Host's context for this call, passed back as the first argument
+   * of each function below. The Plugin never reads through it.
+   */
+  void *ctx;
+  /**
+   * The name of the Pack, as the Plugin gave it to `insert_pack`.
+   */
+  struct RvStr pack;
+  /**
+   * Declines to make the instance, at most once, with a UTF-8 reason of
+   * at most 1024 bytes that a model can read; returns
+   * `RV_ERR_REFUSED`. The run then goes without the Pack.
+   */
+  RvStatus (*refuse)(void *ctx, struct RvStr reason);
+  /**
+   * Adds one tool to the instance, once for each tool it offers. No two
+   * tools of one instance share a name.
+   */
+  RvStatus (*add_tool)(void *ctx, const struct RvToolInfo *info);
+};
+
+/**
+ * The arguments of `RV_TOOL_CALL`: the tool, its arguments, and the
+ * function that ends the call. Every step of one call gets the same
+ * `tool` and `arguments`.
+ */
+struct RvToolCallArgs {
+  /**
+   * `size_of::<RvToolCallArgs>()`; in C, `sizeof(RvToolCallArgs)`.
+   */
+  uint32_t size;
+  /**
+   * Zero.
+   */
+  uint32_t reserved;
+  /**
+   * The Host's context for this step, passed back as the first argument
+   * of the function below. The Plugin never reads through it.
+   */
+  void *ctx;
+  /**
+   * The tool's name, as the instance gave it to `add_tool`.
+   */
+  struct RvStr tool;
+  /**
+   * The call's arguments: the JSON text of the value the caller passed.
+   */
+  struct RvStr arguments;
+  /**
+   * Ends the call with its result, exactly once, in the step that then
+   * returns `RV_OK`.
+   */
+  RvStatus (*finish)(void *ctx, const struct RvToolResult *result);
 };
 
 /**
@@ -236,19 +467,28 @@ struct RvCall {
    */
   const struct RvHost *host;
   /**
-   * The Plugin instance: NULL going into `RV_PLUGIN_LOAD`, which may
-   * set it.
+   * The Plugin instance: NULL going into `RV_PLUGIN_LOAD`, which sets
+   * it, and that pointer on every later call.
    */
   void *plugin;
   /**
-   * The per-run Pack instance; NULL until the Pack verbs exist.
+   * One run's instance of a Pack: NULL going into `RV_PACK_NEW`,
+   * which sets it, that pointer on `RV_PACK_DELETE` and on the
+   * instance's tool calls, and NULL otherwise.
    */
   void *pack_run;
   /**
    * The verb's own arguments: an `RvLoadArgs` for `RV_PLUGIN_LOAD`,
-   * and NULL for `RV_PLUGIN_UNLOAD`.
+   * an `RvPackNewArgs` for `RV_PACK_NEW`, an `RvToolCallArgs` for
+   * `RV_TOOL_CALL`, and NULL for every other verb.
    */
   const void *args;
+  /**
+   * The state of one tool call: NULL going into the call's first
+   * `RV_TOOL_CALL`, what the last step left on each later step and on
+   * `RV_TOOL_CANCEL`, and NULL otherwise.
+   */
+  void *tool_call;
 };
 
 /**
@@ -262,7 +502,8 @@ struct RvCall {
 #define RV_ERR_MISUSE 4
 
 /**
- * The Plugin declined to load; `refuse` returns it.
+ * The Plugin declined to load or to make a Pack instance; `refuse`
+ * returns it.
  */
 #define RV_ERR_REFUSED 5
 
@@ -272,7 +513,12 @@ struct RvCall {
 #define RV_ERR_UNSUPPORTED 6
 
 /**
- * Make the Plugin instance and name the Plugin.
+ * The tool call needs another step; only `RV_TOOL_CALL` returns it.
+ */
+#define RV_PENDING 7
+
+/**
+ * Make the Plugin instance, name the Plugin, and insert its Packs.
  */
 #define RV_PLUGIN_LOAD 1
 
@@ -280,6 +526,59 @@ struct RvCall {
  * Free the Plugin instance.
  */
 #define RV_PLUGIN_UNLOAD 2
+
+/**
+ * Make one run's instance of a Pack and list its tools.
+ */
+#define RV_PACK_NEW 3
+
+/**
+ * Free one run's instance of a Pack.
+ */
+#define RV_PACK_DELETE 4
+
+/**
+ * Run one step of a tool call.
+ */
+#define RV_TOOL_CALL 5
+
+/**
+ * Free the state of a tool call the Host has abandoned.
+ */
+#define RV_TOOL_CANCEL 6
+
+/**
+ * The call succeeded, and its text may hold data an attacker can
+ * influence, such as the contents of a file or a web page. The Host marks
+ * such text before a model reads it. Zero, so a result that names no kind
+ * is treated with care.
+ */
+#define RV_RESULT_UNTRUSTED 0
+
+/**
+ * The call succeeded, and the Plugin vouches for every byte of its text.
+ */
+#define RV_RESULT_TRUSTED 1
+
+/**
+ * The call failed: its arguments do not match the tool's parameters.
+ */
+#define RV_RESULT_INVALID_ARGUMENTS 2
+
+/**
+ * The call failed: what the tool reaches refused or failed the request.
+ */
+#define RV_RESULT_BACKEND 3
+
+/**
+ * The call failed: the request never got through.
+ */
+#define RV_RESULT_TRANSPORT 4
+
+/**
+ * The call failed for any other reason.
+ */
+#define RV_RESULT_OTHER 5
 
 #ifdef __cplusplus
 extern "C" {

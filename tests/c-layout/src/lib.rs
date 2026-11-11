@@ -7,7 +7,7 @@
 //! ## Invariants
 //!
 //! - The C table in `layout.c` and the Rust table in the tests name the
-//!   same entries; a new field or constant joins both.
+//!   same entries, line for line; a new field or constant joins both.
 
 #[cfg(test)]
 #[expect(
@@ -22,8 +22,11 @@ mod tests {
 
     use runvil_plugin_sys::{
         RV_API_MAJOR, RV_API_MINOR, RV_ERR_MISUSE, RV_ERR_REFUSED, RV_ERR_UNSUPPORTED, RV_OK,
-        RV_PLUGIN_LOAD, RV_PLUGIN_UNLOAD, RvCall, RvHost, RvLoadArgs, RvPluginInfo, RvStatus,
-        RvStr, RvVerb,
+        RV_PACK_DELETE, RV_PACK_NEW, RV_PENDING, RV_PLUGIN_LOAD, RV_PLUGIN_UNLOAD,
+        RV_RESULT_BACKEND, RV_RESULT_INVALID_ARGUMENTS, RV_RESULT_OTHER, RV_RESULT_TRANSPORT,
+        RV_RESULT_TRUSTED, RV_RESULT_UNTRUSTED, RV_TOOL_CALL, RV_TOOL_CANCEL, RvCall, RvHost,
+        RvLoadArgs, RvPackInfo, RvPackNewArgs, RvPluginInfo, RvResultKind, RvStatus, RvStr,
+        RvToolCallArgs, RvToolInfo, RvToolResult, RvVerb,
     };
 
     /// One entry of the table in `layout.c`.
@@ -60,66 +63,122 @@ mod tests {
             .collect()
     }
 
-    /// What Rust sees, named as `layout.c` names each entry.
+    /// A type's size, named as `layout.c`'s `SIZE` names it.
+    macro_rules! size {
+        ($type:ty) => {
+            (
+                concat!("sizeof(", stringify!($type), ")"),
+                size_of::<$type>(),
+            )
+        };
+    }
+
+    /// A field's offset, named as `layout.c`'s `OFFSET` names it.
+    macro_rules! offset {
+        ($type:ty, $field:ident) => {
+            (
+                concat!(
+                    "offsetof(",
+                    stringify!($type),
+                    ", ",
+                    stringify!($field),
+                    ")"
+                ),
+                offset_of!($type, $field),
+            )
+        };
+    }
+
+    /// A constant's value, named as `layout.c`'s `VALUE` names it.
+    macro_rules! value {
+        ($constant:ident) => {
+            (stringify!($constant), $constant as usize)
+        };
+    }
+
+    /// What Rust sees, in the order of the table in `layout.c`.
     fn rust_layout() -> BTreeMap<String, usize> {
         [
-            ("sizeof(RvStatus)", size_of::<RvStatus>()),
-            ("sizeof(RvVerb)", size_of::<RvVerb>()),
-            ("sizeof(RvStr)", size_of::<RvStr>()),
-            ("offsetof(RvStr, ptr)", offset_of!(RvStr, ptr)),
-            ("offsetof(RvStr, len)", offset_of!(RvStr, len)),
-            ("sizeof(RvPluginInfo)", size_of::<RvPluginInfo>()),
-            (
-                "offsetof(RvPluginInfo, size)",
-                offset_of!(RvPluginInfo, size),
-            ),
-            (
-                "offsetof(RvPluginInfo, reserved)",
-                offset_of!(RvPluginInfo, reserved),
-            ),
-            (
-                "offsetof(RvPluginInfo, name)",
-                offset_of!(RvPluginInfo, name),
-            ),
-            (
-                "offsetof(RvPluginInfo, version)",
-                offset_of!(RvPluginInfo, version),
-            ),
-            ("sizeof(RvHost)", size_of::<RvHost>()),
-            ("offsetof(RvHost, size)", offset_of!(RvHost, size)),
-            ("offsetof(RvHost, api_major)", offset_of!(RvHost, api_major)),
-            ("offsetof(RvHost, api_minor)", offset_of!(RvHost, api_minor)),
-            ("offsetof(RvHost, reserved)", offset_of!(RvHost, reserved)),
-            ("sizeof(RvLoadArgs)", size_of::<RvLoadArgs>()),
-            ("offsetof(RvLoadArgs, size)", offset_of!(RvLoadArgs, size)),
-            (
-                "offsetof(RvLoadArgs, reserved)",
-                offset_of!(RvLoadArgs, reserved),
-            ),
-            ("offsetof(RvLoadArgs, ctx)", offset_of!(RvLoadArgs, ctx)),
-            (
-                "offsetof(RvLoadArgs, refuse)",
-                offset_of!(RvLoadArgs, refuse),
-            ),
-            (
-                "offsetof(RvLoadArgs, describe_plugin)",
-                offset_of!(RvLoadArgs, describe_plugin),
-            ),
-            ("sizeof(RvCall)", size_of::<RvCall>()),
-            ("offsetof(RvCall, size)", offset_of!(RvCall, size)),
-            ("offsetof(RvCall, verb)", offset_of!(RvCall, verb)),
-            ("offsetof(RvCall, host)", offset_of!(RvCall, host)),
-            ("offsetof(RvCall, plugin)", offset_of!(RvCall, plugin)),
-            ("offsetof(RvCall, pack_run)", offset_of!(RvCall, pack_run)),
-            ("offsetof(RvCall, args)", offset_of!(RvCall, args)),
-            ("RV_OK", RV_OK as usize),
-            ("RV_ERR_MISUSE", RV_ERR_MISUSE as usize),
-            ("RV_ERR_REFUSED", RV_ERR_REFUSED as usize),
-            ("RV_ERR_UNSUPPORTED", RV_ERR_UNSUPPORTED as usize),
-            ("RV_PLUGIN_LOAD", RV_PLUGIN_LOAD as usize),
-            ("RV_PLUGIN_UNLOAD", RV_PLUGIN_UNLOAD as usize),
-            ("RV_API_MAJOR", RV_API_MAJOR as usize),
-            ("RV_API_MINOR", RV_API_MINOR as usize),
+            size!(RvStatus),
+            size!(RvVerb),
+            size!(RvStr),
+            offset!(RvStr, ptr),
+            offset!(RvStr, len),
+            size!(RvPluginInfo),
+            offset!(RvPluginInfo, size),
+            offset!(RvPluginInfo, reserved),
+            offset!(RvPluginInfo, name),
+            offset!(RvPluginInfo, version),
+            size!(RvPackInfo),
+            offset!(RvPackInfo, size),
+            offset!(RvPackInfo, reserved),
+            offset!(RvPackInfo, name),
+            offset!(RvPackInfo, description),
+            size!(RvToolInfo),
+            offset!(RvToolInfo, size),
+            offset!(RvToolInfo, reserved),
+            offset!(RvToolInfo, name),
+            offset!(RvToolInfo, wire_name),
+            offset!(RvToolInfo, description),
+            offset!(RvToolInfo, parameters),
+            size!(RvResultKind),
+            size!(RvToolResult),
+            offset!(RvToolResult, size),
+            offset!(RvToolResult, kind),
+            offset!(RvToolResult, text),
+            size!(RvHost),
+            offset!(RvHost, size),
+            offset!(RvHost, api_major),
+            offset!(RvHost, api_minor),
+            offset!(RvHost, reserved),
+            size!(RvLoadArgs),
+            offset!(RvLoadArgs, size),
+            offset!(RvLoadArgs, reserved),
+            offset!(RvLoadArgs, ctx),
+            offset!(RvLoadArgs, refuse),
+            offset!(RvLoadArgs, describe_plugin),
+            offset!(RvLoadArgs, insert_pack),
+            size!(RvPackNewArgs),
+            offset!(RvPackNewArgs, size),
+            offset!(RvPackNewArgs, reserved),
+            offset!(RvPackNewArgs, ctx),
+            offset!(RvPackNewArgs, pack),
+            offset!(RvPackNewArgs, refuse),
+            offset!(RvPackNewArgs, add_tool),
+            size!(RvToolCallArgs),
+            offset!(RvToolCallArgs, size),
+            offset!(RvToolCallArgs, reserved),
+            offset!(RvToolCallArgs, ctx),
+            offset!(RvToolCallArgs, tool),
+            offset!(RvToolCallArgs, arguments),
+            offset!(RvToolCallArgs, finish),
+            size!(RvCall),
+            offset!(RvCall, size),
+            offset!(RvCall, verb),
+            offset!(RvCall, host),
+            offset!(RvCall, plugin),
+            offset!(RvCall, pack_run),
+            offset!(RvCall, args),
+            offset!(RvCall, tool_call),
+            value!(RV_OK),
+            value!(RV_ERR_MISUSE),
+            value!(RV_ERR_REFUSED),
+            value!(RV_ERR_UNSUPPORTED),
+            value!(RV_PENDING),
+            value!(RV_PLUGIN_LOAD),
+            value!(RV_PLUGIN_UNLOAD),
+            value!(RV_PACK_NEW),
+            value!(RV_PACK_DELETE),
+            value!(RV_TOOL_CALL),
+            value!(RV_TOOL_CANCEL),
+            value!(RV_RESULT_UNTRUSTED),
+            value!(RV_RESULT_TRUSTED),
+            value!(RV_RESULT_INVALID_ARGUMENTS),
+            value!(RV_RESULT_BACKEND),
+            value!(RV_RESULT_TRANSPORT),
+            value!(RV_RESULT_OTHER),
+            value!(RV_API_MAJOR),
+            value!(RV_API_MINOR),
         ]
         .into_iter()
         .map(|(what, value)| (what.to_owned(), value))

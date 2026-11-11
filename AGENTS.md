@@ -17,20 +17,22 @@ Anything else gets a qualified lowercase name, such as Rust's built-in test harn
 ## The contract's rules
 
 - `crates/runvil-plugin-sys/src/lib.rs` is the single source of the contract. `crates/runvil-plugin-sys/include/runvil_plugin.h` is generated from it by `cargo xtask header` and never edited by hand; its crate docs, up to `## Invariants`, become the header's opening comment.
-- A status code, verb, or field keeps its number and position in every version. A reserved verb number is never reused for anything else.
+- A status code, verb, result kind, or field keeps its number and position in every version. A reserved verb number is never reused for anything else.
 - The `runvil-plugin-sys` version is the contract's version, `RV_API_MAJOR`.`RV_API_MINOR`; a unit test checks it. Changing the contract means changing both.
 - While the major version is 0, each version is its own contract, and the SDK accepts only a Host that reports exactly its version. From 1.0, a minor version only adds, at the end of a struct, or as a new verb with an arguments struct of its own.
 - `RvHost` holds only what is true on every call. Each function a Plugin may call back belongs to one verb and sits in that verb's arguments struct, beside the `ctx` it takes first, under that verb's own lifetime and thread rules.
-- A Host keeps each `ctx` valid while the Plugin is loaded, until `RV_PLUGIN_UNLOAD` returns, and answers a call through it outside its verb's rules with `RV_ERR_MISUSE`; it never reads through a `ctx` it has not matched to the call open on the calling thread.
+- A Host keeps the `ctx` of a load valid while the Plugin is loaded, until `RV_PLUGIN_UNLOAD` returns, and answers a call through any `ctx` outside its verb's rules with `RV_ERR_MISUSE`; it never reads through a `ctx` it has not matched to the call open on the calling thread.
+- The contract stays minimal. A verb, a field, or a function joins only when a Plugin that exists needs it, and each one says who calls it, on which thread, how long what it passes stays valid, and who frees what.
+- JSON crosses the contract as text. Neither crate here parses it, so neither needs a JSON library.
 - `runvil-plugin-sys` has no dependencies and no `unsafe`. `runvil-plugin-sdk` depends on `runvil-plugin-sys` alone. Neither ever depends on an Engine or Harness crate.
 - A Plugin shares its process with the Host, so nothing here installs process-global state, such as a panic hook (`clippy.toml` bans `std::panic::set_hook`), and no panic ever unwinds across the C boundary.
-- `testing` in the SDK checks a Plugin's calls the way the Harness's loader does: the same order of checks, the same bounds, and the same rules on names and versions. When the loader's checks change, this changes with them.
+- `testing` in the SDK checks a Plugin's calls the way the Harness's loader does: the same order of checks, the same bounds, the same rules on names, versions, and tool infos, and the same words for each misuse. When the loader's checks change, this changes with them.
 
 ## Engineering
 
 - Prefer types and compiler checks, then behavior tests. A rule a Plugin's constants must follow is checked when the Plugin is compiled, as `entry` checks `Plugin::NAME` and `Plugin::VERSION`.
 - Behavior changes ship with tests in the same change.
-- Unsafe code stays in its explicitly owned boundary: `entry`, the `export_plugin!` expansion, and `testing` in the SDK, and the test-only calls in `tests/c-layout`. Every `unsafe` block has a `// SAFETY:` comment, and every `unsafe fn` a `# Safety` section.
+- Unsafe code stays in its explicitly owned boundary: `entry` and its child modules, the `export_plugin!` expansion, and `testing` in the SDK, and the test-only calls in `tests/c-layout`. Every `unsafe` block has a `// SAFETY:` comment, and every `unsafe fn` a `# Safety` section.
 - Comments explain a non-obvious constraint, ordering requirement, or workaround.
 - New unit tests go in a `#[cfg(test)] mod tests` block in the file under test.
 - Error and status messages are written for a model to read: concise, factual, and self-contained, naming what is missing or unmet.

@@ -2,7 +2,7 @@
 name = "runvil-plugin-sys"
 # The contract's version: `RV_API_MAJOR`.`RV_API_MINOR`, which a unit test
 # checks.
-version = "0.2.0"
+version = "0.3.0"
 description = "The C contract of a runvil Plugin, runvil_plugin.h, and its raw Rust mirror"
 edition.workspace = true
 # The floor a Plugin author's toolchain needs; CI's msrv job builds it.
