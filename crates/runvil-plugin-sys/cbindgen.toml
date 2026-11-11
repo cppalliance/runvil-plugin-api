@@ -10,7 +10,8 @@ no_includes = true
 sys_includes = ["stddef.h", "stdint.h"]
 usize_is_size_t = true
 # Structs are defined by tag (`struct RvCall { ... };`) after the forward
-# typedefs, so `RvHost` can name `RvCall` before its definition, as C needs.
+# typedefs, so C code can write `RvCall` without `struct`, as the
+# declaration of `runvil_plugin` does.
 style = "tag"
 sort_by = "None"
 documentation = true

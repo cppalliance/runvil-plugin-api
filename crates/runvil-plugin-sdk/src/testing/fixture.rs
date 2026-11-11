@@ -9,8 +9,8 @@ use std::ptr;
 
 use runvil_plugin_sys::{
     RV_ERR_UNSUPPORTED, RV_OK, RV_PACK_DELETE, RV_PACK_NEW, RV_PENDING, RV_PLUGIN_LOAD,
-    RV_TOOL_CALL, RV_TOOL_CANCEL, RvCall, RvLoadArgs, RvPackInfo, RvPackNewArgs, RvPluginInfo,
-    RvStatus, RvStr, RvToolCallArgs, RvToolInfo, RvToolResult,
+    RV_TOOL_CALL, RV_TOOL_CANCEL, RvCall, RvFileError, RvLoadArgs, RvPackInfo, RvPackNewArgs,
+    RvPluginInfo, RvStatus, RvStr, RvToolCallArgs, RvToolInfo, RvToolResult,
 };
 
 use super::{Failure, Loaded, load_entry};
@@ -84,6 +84,9 @@ pub(super) enum Breach {
     FinishThenPending,
     /// Hands `finish` a NULL result and returns `RV_PENDING`.
     MisuseThenPending,
+    /// Hands `file_stat` a NULL `stat`, then finishes as if nothing
+    /// happened.
+    FileStatNull,
 }
 
 /// Loads the fixture on this thread with `breach` as its script.
@@ -284,6 +287,14 @@ unsafe fn tool_call(call: *mut RvCall, args: &RvToolCallArgs, breach: Breach) ->
             Breach::MisuseThenPending => {
                 (args.finish)(args.ctx, ptr::null());
                 return RV_PENDING;
+            }
+            Breach::FileStatNull => {
+                let mut error = RvFileError {
+                    kind: 0,
+                    reserved: 0,
+                    text: rv_str(""),
+                };
+                (args.file_stat)(args.ctx, rv_str("/a"), ptr::null_mut(), &raw mut error);
             }
             _ => {}
         }

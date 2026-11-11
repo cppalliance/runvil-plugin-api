@@ -186,7 +186,7 @@ pub(super) fn answer(
         return RV_ERR_MISUSE;
     }
     // SAFETY: a non-NULL `open` is the session of the call running on this
-    // thread, which `open` keeps alive for the call, and no other
+    // thread, which `open_over` keeps alive for the call, and no other
     // reference to it exists while a function runs.
     let session = unsafe { &mut *open };
     let outcome = if !ptr::eq(open.cast::<c_void>(), ctx) {

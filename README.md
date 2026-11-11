@@ -5,7 +5,7 @@ The contract between a runvil Host and its Plugins: a C header, the raw Rust mir
 | Piece | What it is | Who uses it |
 |---|---|---|
 | `crates/runvil-plugin-sys/include/runvil_plugin.h` | The C contract, generated from the Rust source | C, C++, and other non-Rust Plugins |
-| `runvil-plugin-sys` | Raw `#[repr(C)]` types and constants, a line-for-line mirror of the header | The Harness's loader, and Rust Plugins that want no SDK |
+| `runvil-plugin-sys` | Raw `#[repr(C)]` types and constants, the source the header is generated from | The Harness's loader, and Rust Plugins that want no SDK |
 | `runvil-plugin-sdk` | Safe `Plugin` and `Pack` traits, the C entry point, `export_plugin!`, and a fake Host for tests | Most Rust Plugins |
 
 ## What a Plugin does
@@ -91,7 +91,7 @@ export_plugin!(Acme);
 - The Pack's name is a vendor and a Pack id joined by `/`. A prompt reaches the tool above as `hello/greet`, the Pack id and the tool's name.
 - Arguments and parameter schemas cross as JSON text, so the SDK needs no JSON library. A Plugin parses `call.arguments()` with one of its own.
 - A tool call is a future the Host polls once per step, and the Host sends the next step without being woken. A call that does a long job awaits `next_step()` every so often, so that no step works for long and the Host can abandon the call between two steps.
-- A tool reads the files of its run through its `ToolCall`: `stat`, `list`, `read`, and `read_range`. Each goes through the Host, so the run's policy applies to every read. A read that fails returns a `FileError` with a kind and the Host's words for what went wrong, and the call goes on, so the tool decides what the model reads. This version has no method that changes a file.
+- A tool reads the files of its run through its `ToolCall`: `stat`, `list`, `read`, and `read_range`. Each goes through the Host, so the run's policy applies to every read. A read that fails returns a `FileError` with a kind and the Host's words for what went wrong, and the call goes on, so the tool decides what the model reads. The methods work on the thread that runs the step and on no other. This version has no method that changes a file.
 - A panic in `load` or `new_pack` reaches the Host as a refusal, and a panic in a tool call ends that call as a failure. Neither unwinds into the Host.
 
 ### Testing
@@ -115,7 +115,7 @@ let files = Files::new()
 let pack = loaded.new_pack("acme/notes").unwrap().with_files(files);
 ```
 
-`file` and `dir` add a node and every directory on the way to it, and `fails` makes every read of a path fail with the error given, as a path the run's policy denies does.
+`file` and `dir` add a node and every directory on the way to it, and `fails` makes every read of a path fail with the error given, as a path the run's policy denies does. A path that fails has nothing under it: `fails` refuses a directory that has entries, because those entries would stay readable.
 
 ### Linked and library builds of one Plugin
 

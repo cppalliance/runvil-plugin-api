@@ -123,7 +123,7 @@ pub(super) unsafe fn unload<P: Plugin>(call: *mut RvCall) -> RvStatus {
     RV_OK
 }
 
-/// Whether a Host table reporting version `major`.`minor` speaks the
+/// Whether a Host that reports version `major`.`minor` speaks the
 /// contract this crate was built for: exactly that version while the
 /// major version is 0, and from 1.0 the same major version with a minor
 /// version at least as high.

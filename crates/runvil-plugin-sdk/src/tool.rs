@@ -67,9 +67,15 @@ impl ToolInfo {
 /// The file methods read through the Host, so the run's policy applies to
 /// every read, and a read the policy denies fails like any other. Each
 /// method returns once the Host has done the read. A path names a file of
-/// the run, with `/` between its segments, and one that does not begin
-/// with `/` is taken from the run's root. A call that reads many files
-/// awaits [`next_step`] between them every so often.
+/// the run, with `/` between its segments, is at most 4096 bytes long, and
+/// is taken from the run's root whether or not it begins with `/`. A call
+/// that reads many files awaits [`next_step`] between them every so
+/// often.
+///
+/// A file method works only while a step of its call runs, on the thread
+/// that runs it. It fails on any other thread, such as one started with
+/// `std::thread::scope`, and in a `Drop` that runs while the Host cancels
+/// the call.
 #[derive(Clone, Copy, Debug)]
 pub struct ToolCall<'a> {
     state: &'a CallState,

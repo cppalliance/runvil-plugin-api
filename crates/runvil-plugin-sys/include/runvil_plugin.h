@@ -8,11 +8,9 @@
  * crate mirrors it for Rust; `cargo xtask header` writes the header from
  * the crate's source, comments included, so the two never disagree.
  *
- * A Plugin is one entry point, with the shape of `runvil_plugin` (in
- * Rust, `PluginEntry`). A library Plugin exports it under that name; a
- * linked Plugin has the same shape under a name of its own crate's
- * choosing. Declaring the types is safe Rust; only calling an entry point
- * or reading through its pointers needs `unsafe`.
+ * A Plugin is one entry point, with the shape of `runvil_plugin`. A
+ * library Plugin exports it under that name; a linked Plugin has the same
+ * shape under any name.
  *
  * # The contract
  *
@@ -28,8 +26,8 @@
  * - Strings are a pointer plus a length, UTF-8, not NUL-terminated.
  * - A struct or a string that one side passes to the other is valid only
  *   until the function it was passed to returns. The receiver copies what
- *   it keeps. What a file function hands back stays valid a little
- *   longer, as the section on files says.
+ *   it keeps. What a file function hands back stays valid until the next
+ *   file function or the end of the step, as the section on files says.
  * - Verb names follow `RV_<OBJECT>_<ACTION>`. Libraries open and close;
  *   Plugins load and unload.
  *
@@ -50,6 +48,8 @@
  *   the state of a tool call the Host has abandoned.
  *
  * A Plugin answers a verb it does not know with `RV_ERR_UNSUPPORTED`.
+ * `RV_PLUGIN_UNLOAD`, `RV_PACK_DELETE`, and `RV_TOOL_CANCEL` return
+ * `RV_OK`, and the Host ignores their status.
  *
  * # Packs
  *
@@ -86,45 +86,57 @@
  *
  * # Files
  *
- * - A step reads the files of its run through the three file functions
- *   in its `RvToolCallArgs`: `file_stat`, `file_list`, and `file_read`.
- *   They are how a tool reaches a run's files, so the run's policy applies
- *   to every read. This version has no function that changes a file.
- * - A path names a file of the run, with `/` between its segments. A path
- *   that does not begin with `/` is taken from the run's root.
+ * - A step reads its run's files only through the three file functions in
+ *   its `RvToolCallArgs`: `file_stat`, `file_list`, and `file_read`, so
+ *   the run's policy applies to every read. This version has no function
+ *   that changes a file.
+ * - A path names a file of the run, with `/` between its segments, and is
+ *   at most 4096 bytes long. Every path is taken from the run's root,
+ *   whether or not it begins with `/`. An empty segment and a `.` segment
+ *   change nothing, a `..` segment steps up one directory, and a `\` is
+ *   read as `/`. An empty path, and a path that steps above the root,
+ *   fail as file errors.
  * - `file_stat`, and each entry `file_list` hands back, describe a link
  *   and not what it leads to. `file_list` and `file_read` act on what a
  *   link leads to.
  * - The Plugin passes each file function a struct for its result and an
- *   `RvFileError`, both its own. The function returns `RV_OK` and
- *   fills the result, or returns `RV_ERR_FILE` and fills the error. A
- *   file function that fails does not fail the tool call: the tool
- *   decides what its result says.
+ *   `RvFileError`, both its own, and both required. The function
+ *   returns `RV_OK` and fills the result, or returns `RV_ERR_FILE`
+ *   and fills the error. A function that returns `RV_ERR_MISUSE` fills
+ *   neither. A file function that fails does not fail the tool call: the
+ *   tool decides what its result says.
  * - What a file function hands back through those structs belongs to the
  *   Host: the bytes, the entries and the names in them, and an error's
  *   text. Each stays valid until the next file function called through
  *   the same `ctx`, or until the step returns, whichever comes first. The
- *   Plugin copies what it keeps and frees none of it.
+ *   Plugin copies what it keeps and frees none of it. The Host reads
+ *   `path` before it releases what it lent, so a name from a listing may
+ *   be part of the next `path`.
+ * - The Host holds what it hands back in memory, so a Plugin reads a
+ *   large file in ranges.
  * - A file function returns when its operation is done. A tool that
  *   reads many files returns `RV_PENDING` between them now and then, so
  *   that no step works for long.
  *
  * # Threads and lifetime
  *
- * - `RV_PLUGIN_LOAD` runs on the thread of the insert call. Every other
- *   verb may come on any thread, and the steps of one tool call may come
- *   on different threads.
+ * - `RV_PLUGIN_LOAD` runs on the thread on which the Host loads the
+ *   Plugin. Every other verb may come on any thread, and the steps of one
+ *   tool call may come on different threads.
  * - Calls may run at the same time on different threads, with three
- *   exceptions. No two calls that name the same `tool_call` run at the
- *   same time. `RV_PACK_DELETE` comes after every tool call of its
+ *   exceptions. No two steps of one tool call run at the same time, and
+ *   `RV_TOOL_CANCEL` runs beside no step of its call.
+ *   `RV_PACK_DELETE` comes after every tool call of its
  *   `pack_run` has ended, and runs beside no call that names it.
  *   `RV_PLUGIN_UNLOAD` comes after every Pack instance of the Plugin is
  *   deleted, and runs beside no other call.
  * - The functions in a verb's arguments struct answer only while that
  *   call runs, only on its thread, and only for its `ctx`. Any other use
  *   returns `RV_ERR_MISUSE`, and so does a function called against its
- *   own rules, such as `describe_plugin` called twice. A misuse during a
- *   call fails that call, whatever status the Plugin returns.
+ *   own rules, such as `describe_plugin` called twice. A misuse on the
+ *   call's own thread fails that call, whatever status the Plugin
+ *   returns. A function called on another thread while its call runs
+ *   returns `RV_ERR_MISUSE` and has no other effect.
  * - The Host keeps the `ctx` of a load valid while the Plugin is loaded,
  *   until `RV_PLUGIN_UNLOAD` returns, so a late call through it is
  *   answered `RV_ERR_MISUSE` instead of reaching freed memory. The `ctx`
@@ -151,27 +163,22 @@
  *   which frees the state; its `call->tool_call` is NULL when no step set
  *   it. Each call gets one or the other, never both.
  *
- * # Reserved verbs
+ * # Reserved numbers
  *
- * Verbs 7 and 8 are reserved for later versions, so their numbers never
- * change. Each one gets its own arguments struct behind `call->args`. No
- * constants are declared for them yet.
- *
- * - `RV_PRELUDE_INSTALL` (7): install the Pack's native prelude, once per
- *   Lua VM.
- * - `RV_PACK_RENDER` (8): render the tools a section offered from one
- *   Pack for one model.
+ * Verbs 7 and 8 and status codes 1 to 3 are reserved for later versions,
+ * so those numbers never get another meaning. This version declares no
+ * constant for them, sends neither verb, and returns none of those codes.
  *
  * # Status codes
  *
  * - `RV_OK` (0) is success.
- * - Codes 1 to 3 are reserved for the Lua API's own errors: Lua raised an
- *   error, a fatal error such as the memory limit or a cancel, and a wrong
- *   type.
+ * - Codes 1 to 3 are reserved.
  * - `RV_ERR_MISUSE` (4) means the caller broke the contract.
  * - `RV_ERR_REFUSED` (5) means the Plugin declined: to load, or to make
  *   a Pack instance.
- * - `RV_ERR_UNSUPPORTED` (6) means the Plugin doesn't know the verb.
+ * - `RV_ERR_UNSUPPORTED` (6) means the Plugin cannot answer the call: it
+ *   does not know the verb, the Host reports a version the Plugin was not
+ *   built for, or a struct's `size` is smaller than the Plugin expects.
  * - `RV_PENDING` (7) means a tool call needs another step. Only
  *   `RV_TOOL_CALL` returns it.
  * - `RV_ERR_FILE` (8) means a file function failed. Only a file
@@ -183,12 +190,17 @@
  *   the `runvil-plugin-sys` crate's version is the same number.
  * - A 0.x version makes no compatibility promise. Each one is a contract
  *   of its own, and a Plugin built for one loads only in a Host whose
- *   `RvHost` reports exactly that version.
- * - From 1.0, a minor version only adds: a field at the end of a struct,
- *   such as a function at the end of a verb's arguments struct, whose
- *   `size` field shows that it is there, or a verb with an arguments
- *   struct of its own. A Plugin built for 1.n loads in a Host that reports
- *   major version 1 and a minor version of at least n.
+ *   `RvHost` reports exactly that version. The Plugin checks the
+ *   version first in `RV_PLUGIN_LOAD`, before it reads `call->args`,
+ *   and answers a version it was not built for with
+ *   `RV_ERR_UNSUPPORTED`.
+ * - From 1.0, a minor version only adds: a field at the end of a struct
+ *   that has a `size` field, which shows whether the field is there, such
+ *   as a function at the end of a verb's arguments struct; a verb with an
+ *   arguments struct of its own; or a number for a result kind, a file
+ *   type, or a file error kind. A struct with no `size` field never
+ *   changes. A Plugin built for 1.n loads in a Host that reports major
+ *   version 1 and a minor version of at least n.
  */
 
 #ifndef RUNVIL_PLUGIN_H
@@ -352,7 +364,7 @@ struct RvFileError {
  */
 struct RvPluginInfo {
   /**
-   * `size_of::<RvPluginInfo>()`; in C, `sizeof(RvPluginInfo)`.
+   * The size of this struct in bytes: `sizeof(RvPluginInfo)`.
    */
   uint32_t size;
   /**
@@ -375,7 +387,7 @@ struct RvPluginInfo {
  */
 struct RvPackInfo {
   /**
-   * `size_of::<RvPackInfo>()`; in C, `sizeof(RvPackInfo)`.
+   * The size of this struct in bytes: `sizeof(RvPackInfo)`.
    */
   uint32_t size;
   /**
@@ -399,7 +411,7 @@ struct RvPackInfo {
  */
 struct RvToolInfo {
   /**
-   * `size_of::<RvToolInfo>()`; in C, `sizeof(RvToolInfo)`.
+   * The size of this struct in bytes: `sizeof(RvToolInfo)`.
    */
   uint32_t size;
   /**
@@ -433,7 +445,7 @@ struct RvToolInfo {
  */
 struct RvToolResult {
   /**
-   * `size_of::<RvToolResult>()`; in C, `sizeof(RvToolResult)`.
+   * The size of this struct in bytes: `sizeof(RvToolResult)`.
    */
   uint32_t size;
   /**
@@ -455,7 +467,7 @@ struct RvToolResult {
  */
 struct RvHost {
   /**
-   * `size_of::<RvHost>()`; in C, `sizeof(RvHost)`.
+   * The size of this struct in bytes: `sizeof(RvHost)`.
    */
   uint32_t size;
   /**
@@ -478,7 +490,7 @@ struct RvHost {
  */
 struct RvLoadArgs {
   /**
-   * `size_of::<RvLoadArgs>()`; in C, `sizeof(RvLoadArgs)`.
+   * The size of this struct in bytes: `sizeof(RvLoadArgs)`.
    */
   uint32_t size;
   /**
@@ -513,7 +525,7 @@ struct RvLoadArgs {
  */
 struct RvPackNewArgs {
   /**
-   * `size_of::<RvPackNewArgs>()`; in C, `sizeof(RvPackNewArgs)`.
+   * The size of this struct in bytes: `sizeof(RvPackNewArgs)`.
    */
   uint32_t size;
   /**
@@ -549,7 +561,7 @@ struct RvPackNewArgs {
  */
 struct RvToolCallArgs {
   /**
-   * `size_of::<RvToolCallArgs>()`; in C, `sizeof(RvToolCallArgs)`.
+   * The size of this struct in bytes: `sizeof(RvToolCallArgs)`.
    */
   uint32_t size;
   /**
@@ -575,21 +587,21 @@ struct RvToolCallArgs {
    */
   RvStatus (*finish)(void *ctx, const struct RvToolResult *result);
   /**
-   * Says what `path`, at most 4096 bytes, names. Fills `stat`.
+   * Says what `path` names. Fills `stat`. A path longer than 4096 bytes
+   * is a misuse, here and in the two functions below.
    */
   RvStatus (*file_stat)(void *ctx, struct RvStr path, struct RvStat *stat, struct RvFileError *error);
   /**
-   * Lists the directory at `path`, at most 4096 bytes. Fills `entries`.
+   * Lists the directory at `path`. Fills `entries`.
    */
   RvStatus (*file_list)(void *ctx,
                         struct RvStr path,
                         struct RvDirEntries *entries,
                         struct RvFileError *error);
   /**
-   * Reads up to `len` bytes of the file at `path`, at most 4096 bytes,
-   * from the byte `offset` on. Fills `bytes`, with fewer than `len`
-   * bytes when the file ends first, and none when `offset` is at or
-   * past its end.
+   * Reads up to `len` bytes of the file at `path`, starting at the byte
+   * `offset`. Fills `bytes`, with fewer than `len` bytes when the file
+   * ends first, and none when `offset` is at or past its end.
    */
   RvStatus (*file_read)(void *ctx,
                         struct RvStr path,
@@ -604,7 +616,7 @@ struct RvToolCallArgs {
  */
 struct RvCall {
   /**
-   * `size_of::<RvCall>()`; in C, `sizeof(RvCall)`.
+   * The size of this struct in bytes: `sizeof(RvCall)`.
    */
   uint32_t size;
   /**
@@ -622,8 +634,8 @@ struct RvCall {
   void *plugin;
   /**
    * One run's instance of a Pack: NULL going into `RV_PACK_NEW`,
-   * which sets it, that pointer on `RV_PACK_DELETE` and on the
-   * instance's tool calls, and NULL otherwise.
+   * which sets it, that pointer on `RV_PACK_DELETE`,
+   * `RV_TOOL_CALL`, and `RV_TOOL_CANCEL`, and NULL otherwise.
    */
   void *pack_run;
   /**
@@ -657,7 +669,9 @@ struct RvCall {
 #define RV_ERR_REFUSED 5
 
 /**
- * The Plugin does not know the verb it was sent.
+ * The Plugin cannot answer the call: it does not know the verb, it was
+ * not built for the Host's version, or a struct is shorter than it
+ * expects.
  */
 #define RV_ERR_UNSUPPORTED 6
 

@@ -15,9 +15,11 @@ use crate::{DirEntry, FileError, FileErrorKind, FileType, Stat};
 /// let pack = loaded.new_pack("acme/notes").unwrap().with_files(files);
 /// ```
 ///
-/// A path is resolved from the root, so `notes/a.md` and `/notes/a.md`
-/// name one file. A `.` segment and a repeated `/` change nothing, and a
-/// `..` segment steps up one directory and stops at the root.
+/// A path is resolved from the root, as the Harness resolves it, so
+/// `notes/a.md` and `/notes/a.md` name one file. A `.` segment and a
+/// repeated `/` change nothing, a `..` segment steps up one directory, and
+/// a `\` is read as `/`. An empty path, and a path that steps above the
+/// root, fail.
 ///
 /// [`stat`](Files::stat), [`list`](Files::list), and
 /// [`read`](Files::read) answer as the fake Host's file functions do, for
@@ -50,8 +52,8 @@ impl Files {
     /// every directory on the way to it.
     ///
     /// # Panics
-    /// Panics when `path` names the root, or lies under something that is
-    /// not a directory.
+    /// Panics when `path` names the root, lies under something that is
+    /// not a directory, or names a directory that has entries.
     #[must_use]
     pub fn file(self, path: &str, contents: impl AsRef<[u8]>) -> Files {
         self.with(path, Node::File(contents.as_ref().to_vec()))
@@ -73,8 +75,9 @@ impl Files {
     /// directory lists it as an empty file.
     ///
     /// # Panics
-    /// Panics when `path` names the root, or lies under something that is
-    /// not a directory.
+    /// Panics when `path` names the root, lies under something that is
+    /// not a directory, or names a directory that has entries, which
+    /// would stay readable.
     #[must_use]
     pub fn fails(self, path: &str, error: FileError) -> Files {
         self.with(path, Node::Fails(error))
@@ -95,6 +98,13 @@ impl Files {
                 "{parent} is not a directory, so nothing lies under it"
             );
             parent = parent_of(parent);
+        }
+        if node != Node::Directory {
+            let under = format!("{path}/");
+            assert!(
+                !self.nodes.keys().any(|key| key.starts_with(&under)),
+                "{path} is a directory with entries, so it stays one"
+            );
         }
         self.nodes.insert(path, node);
         self
@@ -190,11 +200,16 @@ fn resolve(path: &str) -> Result<String, FileError> {
         return Err(FileError::new(FileErrorKind::Other, "path is empty"));
     }
     let mut segments = Vec::new();
-    for segment in path.split('/') {
+    for segment in path.split(['/', '\\']) {
         match segment {
             "" | "." => {}
             ".." => {
-                segments.pop();
+                if segments.pop().is_none() {
+                    return Err(FileError::new(
+                        FileErrorKind::Other,
+                        "path contains a traversal segment",
+                    ));
+                }
             }
             _ => segments.push(segment),
         }
@@ -260,7 +275,8 @@ mod tests {
             ("//a///b/", "/a/b"),
             ("/a/./b", "/a/b"),
             ("/a/x/../b", "/a/b"),
-            ("/../..", "/"),
+            ("/a/..", "/"),
+            ("a\\b", "/a/b"),
             (".", "/"),
         ] {
             assert_eq!(resolve(path).unwrap(), resolved, "{path}");
@@ -269,6 +285,16 @@ mod tests {
             failure(resolve("")),
             (FileErrorKind::Other, "path is empty".to_owned())
         );
+        for above in ["..", "/..", "/a/../..", "a/../../b"] {
+            assert_eq!(
+                failure(resolve(above)),
+                (
+                    FileErrorKind::Other,
+                    "path contains a traversal segment".to_owned()
+                ),
+                "{above}"
+            );
+        }
     }
 
     #[test]
@@ -362,6 +388,25 @@ mod tests {
     #[should_panic(expected = "/a is not a directory, so nothing lies under it")]
     fn a_node_under_a_file_is_the_tests_own_fault() {
         let _tree = Files::new().file("/a", "x").file("/a/b", "y");
+    }
+
+    #[test]
+    #[should_panic(expected = "/secret is a directory with entries, so it stays one")]
+    fn a_failure_over_a_directory_with_entries_is_the_tests_own_fault() {
+        let _tree = Files::new()
+            .file("/secret/key", "k")
+            .fails("/secret", denied());
+    }
+
+    #[test]
+    fn an_empty_directory_can_become_a_file_or_a_failure() {
+        let tree = Files::new()
+            .dir("/a")
+            .dir("/b")
+            .file("/a", "x")
+            .fails("/b", denied());
+        assert_eq!(tree.read("/a", 0, u64::MAX), Ok(b"x".to_vec()));
+        assert_eq!(tree.stat("/b"), Err(denied()));
     }
 
     #[test]

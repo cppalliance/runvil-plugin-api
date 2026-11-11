@@ -24,7 +24,7 @@ Anything else gets a qualified lowercase name, such as Rust's built-in test harn
 - A Host keeps the `ctx` of a load valid while the Plugin is loaded, until `RV_PLUGIN_UNLOAD` returns, and answers a call through any `ctx` outside its verb's rules with `RV_ERR_MISUSE`; it never reads through a `ctx` it has not matched to the call open on the calling thread.
 - The contract stays minimal. A verb, a field, or a function joins only when a Plugin that exists needs it, and each one says who calls it, on which thread, how long what it passes stays valid, and who frees what.
 - JSON crosses the contract as text. Neither crate here parses it, so neither needs a JSON library.
-- A tool reaches its run's files only through the file functions of its step, so the run's policy applies to every operation. What a file function hands back belongs to the Host and stays valid until the step's next file function, so the SDK copies it before it returns.
+- A tool reaches its run's files only through the file functions of its step, so the run's policy applies to every operation. What a file function hands back belongs to the Host and stays valid until the step's next file function or the end of the step, so the SDK copies it before it returns.
 - `runvil-plugin-sys` has no dependencies and no `unsafe`. `runvil-plugin-sdk` depends on `runvil-plugin-sys` alone. Neither ever depends on an Engine or Harness crate.
 - A Plugin shares its process with the Host, so nothing here installs process-global state, such as a panic hook (`clippy.toml` bans `std::panic::set_hook`), and no panic ever unwinds across the C boundary.
 - `testing` in the SDK checks a Plugin's calls the way the Harness's loader does: the same order of checks, the same bounds, the same rules on names, versions, and tool infos, and the same words for each misuse. When the loader's checks change, this changes with them.
@@ -33,7 +33,7 @@ Anything else gets a qualified lowercase name, such as Rust's built-in test harn
 
 - Prefer types and compiler checks, then behavior tests. A rule a Plugin's constants must follow is checked when the Plugin is compiled, as `entry` checks `Plugin::NAME` and `Plugin::VERSION`.
 - Behavior changes ship with tests in the same change.
-- Unsafe code stays in its explicitly owned boundary: `entry` and its child modules, the `export_plugin!` expansion, and `testing` in the SDK, and the test-only calls in `tests/c-layout`. Every `unsafe` block has a `// SAFETY:` comment, and every `unsafe fn` a `# Safety` section.
+- Unsafe code stays in its explicitly owned boundary: in the SDK, `entry` and its child modules, the `export_plugin!` expansion, and `testing`; in `tests/c-layout`, the test-only calls. Every `unsafe` block has a `// SAFETY:` comment, and every `unsafe fn` a `# Safety` section.
 - Comments explain a non-obvious constraint, ordering requirement, or workaround.
 - New unit tests go in a `#[cfg(test)] mod tests` block in the file under test.
 - Error and status messages are written for a model to read: concise, factual, and self-contained, naming what is missing or unmet.

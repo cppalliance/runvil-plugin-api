@@ -174,6 +174,11 @@ mod tests {
                 Failure::Misused("finish was handed a NULL result"),
                 1,
             ),
+            (
+                Breach::FileStatNull,
+                Failure::Misused("file_stat was handed a NULL stat pointer"),
+                0,
+            ),
         ] {
             let loaded = fixture::load(breach).unwrap();
             let pack = loaded.new_pack("acme/fixture").unwrap();

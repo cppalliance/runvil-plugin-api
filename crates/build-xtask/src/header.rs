@@ -153,8 +153,8 @@ fn struct_names(source: &str) -> Vec<&str> {
 }
 
 /// One `typedef struct X X;` for each of `names`. Declaring every struct
-/// ahead of the definitions lets each one name any other, as `RvHost`
-/// names `RvCall`.
+/// ahead of the definitions lets each one name any other, as `RvDirEntry`
+/// names `RvStat`, and lets C code write the name without `struct`.
 fn forward_typedefs(names: &[&str]) -> String {
     names
         .iter()

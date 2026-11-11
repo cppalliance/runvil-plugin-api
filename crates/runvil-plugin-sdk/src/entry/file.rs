@@ -3,6 +3,7 @@
 //! back before it returns, because the Host keeps it only until the next
 //! file function.
 
+use std::ffi::c_void;
 use std::ptr;
 use std::slice;
 use std::sync::atomic::Ordering;
@@ -94,14 +95,32 @@ pub(crate) fn read(
     Ok(unsafe { lent(bytes.ptr, bytes.len) }.to_vec())
 }
 
-/// The arguments of the step that is running for the call `state` belongs
-/// to, which hold the Host's file functions.
+/// What a file method needs of the step that is running: its `ctx` and
+/// its three file functions. They are copied out of the step's arguments,
+/// so nothing here borrows those arguments past the step.
+#[derive(Clone, Copy)]
+struct Step {
+    ctx: *mut c_void,
+    file_stat: unsafe extern "C" fn(*mut c_void, RvStr, *mut RvStat, *mut RvFileError) -> RvStatus,
+    file_list:
+        unsafe extern "C" fn(*mut c_void, RvStr, *mut RvDirEntries, *mut RvFileError) -> RvStatus,
+    file_read: unsafe extern "C" fn(
+        *mut c_void,
+        RvStr,
+        u64,
+        u64,
+        *mut RvBytes,
+        *mut RvFileError,
+    ) -> RvStatus,
+}
+
+/// The step that is running for the call `state` belongs to.
 ///
 /// Fails without asking the Host when `path` is longer than the contract
 /// allows, which the Host would treat as a misuse and fail the whole call
 /// for, and when no step is running, as in a `Drop` that runs while the
 /// call is canceled.
-fn running_step<'a>(state: &'a CallState, path: &str) -> Result<&'a RvToolCallArgs, FileError> {
+fn running_step(state: &CallState, path: &str) -> Result<Step, FileError> {
     if path.len() > MAX_PATH {
         return Err(FileError::new(
             FileErrorKind::Other,
@@ -119,7 +138,13 @@ fn running_step<'a>(state: &'a CallState, path: &str) -> Result<&'a RvToolCallAr
     // A `ToolCall` borrows its call, so code that holds one runs inside a
     // step of that call, or on a thread a step waits for before it
     // returns, and the Host keeps the arguments unchanged for the step.
-    Ok(unsafe { &*step })
+    let args: &RvToolCallArgs = unsafe { &*step };
+    Ok(Step {
+        ctx: args.ctx,
+        file_stat: args.file_stat,
+        file_list: args.file_list,
+        file_read: args.file_read,
+    })
 }
 
 /// An `RvFileError` for a file function to fill.
@@ -187,6 +212,7 @@ unsafe fn text(s: RvStr) -> String {
 mod tests {
     use std::ffi::c_void;
     use std::ptr;
+    use std::sync::Mutex;
     use std::sync::atomic::Ordering;
 
     use runvil_plugin_sys::{
@@ -224,18 +250,46 @@ mod tests {
 
     struct Tools;
 
+    /// What the last `guarded` call's guard got from `stat` when it
+    /// dropped.
+    static DROPPED: Mutex<Option<Result<Stat, FileError>>> = Mutex::new(None);
+
+    /// Stats its call's path when it drops, and keeps the answer.
+    struct StatOnDrop<'a>(ToolCall<'a>);
+
+    impl Drop for StatOnDrop<'_> {
+        fn drop(&mut self) {
+            let answer = self.0.stat(self.0.arguments());
+            if let Ok(mut dropped) = DROPPED.lock() {
+                *dropped = Some(answer);
+            }
+        }
+    }
+
     impl Pack for Tools {
         fn tools(&self) -> Vec<ToolInfo> {
-            ["stat", "list", "read", "head", "twice", "threaded"]
-                .into_iter()
-                .map(|name| ToolInfo::new(name, "A tool.", SCHEMA))
-                .collect()
+            [
+                "stat", "list", "read", "head", "twice", "threaded", "early", "guarded",
+            ]
+            .into_iter()
+            .map(|name| ToolInfo::new(name, "A tool.", SCHEMA))
+            .collect()
         }
 
         fn call<'a>(&'a self, call: ToolCall<'a>) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
+            // `early` reads here, before its future exists.
+            let early = (call.tool() == "early").then(|| call.read(call.arguments()));
             Box::pin(async move {
                 let path = call.arguments();
                 let text = match call.tool() {
+                    "early" => early
+                        .expect("the read ran before the future")
+                        .map(|bytes| format!("{bytes:?}")),
+                    "guarded" => {
+                        let _guard = StatOnDrop(call);
+                        next_step().await;
+                        Ok("done".to_owned())
+                    }
                     "stat" => call.stat(path).map(|stat| format!("{stat:?}")),
                     "list" => call.list(path).map(|entries| format!("{entries:?}")),
                     "read" => call.read(path).map(|bytes| format!("{bytes:?}")),
@@ -361,6 +415,29 @@ mod tests {
     #[test]
     fn each_step_reads_through_its_own_arguments() {
         assert_eq!(run("twice", "/notes/a.md"), Ok("true".to_owned()));
+    }
+
+    #[test]
+    fn a_file_method_works_before_the_calls_future_exists() {
+        assert_eq!(run("early", "/notes/a.md"), Ok(format!("{:?}", b"hello")));
+    }
+
+    #[test]
+    fn a_file_method_in_a_drop_that_runs_as_the_call_is_canceled_never_asks_the_host() {
+        let loaded = testing::load::<Reader>().unwrap();
+        let pack = loaded.new_pack("acme/reader").unwrap().with_files(files());
+        let mut call = pack.start("guarded", "/notes/a.md");
+        assert_eq!(call.step(), Ok(None));
+        // The drop sends `RV_TOOL_CANCEL`, which drops the future and its
+        // guard with no step running.
+        drop(call);
+        assert_eq!(
+            DROPPED.lock().unwrap().take(),
+            Some(Err(FileError::new(
+                FileErrorKind::Other,
+                "no step of the tool call is running, so its files are out of reach"
+            )))
+        );
     }
 
     #[test]

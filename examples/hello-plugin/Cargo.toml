@@ -1,7 +1,7 @@
 [package]
 name = "hello-plugin"
 version = "0.1.0"
-description = "The smallest library Plugin: it loads, names itself, and unloads"
+description = "A small library Plugin: it loads, names itself, and inserts one Pack with one tool"
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
