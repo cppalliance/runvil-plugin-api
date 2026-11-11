@@ -16,7 +16,7 @@ const TOOL_INFO: Shape = shape!("add_tool", "info", "RvToolInfo");
 const TOOL_NAME: Field = field!("the tool's name", 64);
 const WIRE_NAME: Field = field!("the tool's wire name", 64);
 const DESCRIPTION: Field = field!("the tool's description", 65536);
-const PARAMETERS: Field = field!("the tool's parameters", 65536);
+const PARAMETERS: Field = field!("the tool's parameter schema", 65536);
 
 /// Records the Plugin's refusal to make a Pack instance.
 pub(super) unsafe extern "C" fn refuse(ctx: *mut c_void, reason: RvStr) -> RvStatus {
@@ -54,7 +54,7 @@ pub(super) unsafe extern "C" fn add_tool(ctx: *mut c_void, info: *const RvToolIn
         // SAFETY: as above.
         let parameters = unsafe { PARAMETERS.read(info.parameters) }?;
         if !json::is_object(&parameters) {
-            return Err("the tool's parameters are not the JSON text of an object");
+            return Err("the tool's parameter schema is not the JSON text of an object");
         }
         session.tools.push(ToolInfo {
             name,
@@ -115,7 +115,7 @@ mod tests {
             (Breach::NoDescription, "the tool's description is empty"),
             (
                 Breach::Parameters,
-                "the tool's parameters are not the JSON text of an object",
+                "the tool's parameter schema is not the JSON text of an object",
             ),
             (
                 Breach::LoadFunctionInPackNew,
