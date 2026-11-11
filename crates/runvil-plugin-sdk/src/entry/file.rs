@@ -9,11 +9,11 @@ use std::slice;
 use std::sync::atomic::Ordering;
 
 use runvil_plugin_sys::{
-    RV_ERR_FILE, RV_OK, RvBytes, RvDirEntries, RvFileError, RvStat, RvStatus, RvStr, RvToolCallArgs,
+    RV_ERR_FILE, RV_MAX_PATH, RV_OK, RvBytes, RvDirEntries, RvFileError, RvStat, RvStatus, RvStr,
+    RvToolCallArgs,
 };
 
 use super::rv_str;
-use crate::names::MAX_PATH;
 use crate::tool::CallState;
 use crate::{DirEntry, FileError, FileErrorKind, FileType, Stat};
 
@@ -121,10 +121,10 @@ struct Step {
 /// for, and when no step is running, as in a `Drop` that runs while the
 /// call is canceled.
 fn running_step(state: &CallState, path: &str) -> Result<Step, FileError> {
-    if path.len() > MAX_PATH {
+    if path.len() > RV_MAX_PATH {
         return Err(FileError::new(
             FileErrorKind::Other,
-            format!("the path is longer than {MAX_PATH} bytes"),
+            format!("the path is longer than {RV_MAX_PATH} bytes"),
         ));
     }
     let step = state.step.load(Ordering::Acquire);

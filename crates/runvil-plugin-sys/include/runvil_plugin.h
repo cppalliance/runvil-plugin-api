@@ -23,7 +23,9 @@
  *   the Host speaks. Each function a Plugin may call back belongs to one
  *   verb and sits in that verb's arguments struct, behind `call->args`,
  *   beside the `ctx` pointer it takes first.
- * - Strings are a pointer plus a length, UTF-8, not NUL-terminated.
+ * - Strings are a pointer plus a length, UTF-8, not NUL-terminated. Each
+ *   string a Plugin passes has a limit in bytes, which one of the
+ *   `RV_MAX_` constants names, and a longer string is a misuse.
  * - A struct or a string that one side passes to the other is valid only
  *   until the function it was passed to returns. The receiver copies what
  *   it keeps. What a file function hands back stays valid until the next
@@ -91,11 +93,11 @@
  *   the run's policy applies to every read. This version has no function
  *   that changes a file.
  * - A path names a file of the run, with `/` between its segments, and is
- *   at most 4096 bytes long. Every path is taken from the run's root,
- *   whether or not it begins with `/`. An empty segment and a `.` segment
- *   change nothing, a `..` segment steps up one directory, and a `\` is
- *   read as `/`. An empty path, and a path that steps above the root,
- *   fail as file errors.
+ *   at most `RV_MAX_PATH` bytes long. Every path is taken from the run's
+ *   root, whether or not it begins with `/`. An empty segment and a `.`
+ *   segment change nothing, a `..` segment steps up one directory, and a
+ *   `\` is read as `/`. An empty path, and a path that steps above the
+ *   root, fail as file errors.
  * - `file_stat`, and each entry `file_list` hands back, describe a link
  *   and not what it leads to. `file_list` and `file_read` act on what a
  *   link leads to.
@@ -236,6 +238,31 @@ typedef struct RvCall RvCall;
 #define RV_API_MINOR 4
 
 /**
+ * The most bytes in a name segment, a version, or a wire name.
+ */
+#define RV_MAX_NAME 64
+
+/**
+ * The most bytes in a refusal reason or a Pack's description.
+ */
+#define RV_MAX_LINE 1024
+
+/**
+ * The most bytes in a path a file function takes.
+ */
+#define RV_MAX_PATH 4096
+
+/**
+ * The most bytes in a tool's description, and in its parameters.
+ */
+#define RV_MAX_TOOL_TEXT 65536
+
+/**
+ * The most bytes in the text of a tool call's result.
+ */
+#define RV_MAX_RESULT 16777216
+
+/**
  * What every function in the contract returns: zero for success.
  */
 typedef uint32_t RvStatus;
@@ -372,12 +399,12 @@ struct RvPluginInfo {
    */
   uint32_t reserved;
   /**
-   * 1 to 64 bytes of lowercase ASCII letters, digits, `-`, `_`, and `.`:
-   * one name segment, such as `acme-url`.
+   * One name segment, such as `acme-url`: 1 to `RV_MAX_NAME` bytes of
+   * lowercase ASCII letters, digits, `-`, `_`, and `.`.
    */
   struct RvStr name;
   /**
-   * Non-empty, at most 64 bytes, with no control characters.
+   * Non-empty, at most `RV_MAX_NAME` bytes, with no control characters.
    */
   struct RvStr version;
 };
@@ -400,8 +427,8 @@ struct RvPackInfo {
    */
   struct RvStr name;
   /**
-   * One line saying what the Pack offers: at most 1024 bytes with no
-   * control characters. It may be empty.
+   * One line saying what the Pack offers: at most `RV_MAX_LINE` bytes
+   * with no control characters. It may be empty.
    */
   struct RvStr description;
 };
@@ -423,19 +450,19 @@ struct RvToolInfo {
    */
   struct RvStr name;
   /**
-   * The name a model calls the tool by: 1 to 64 bytes of ASCII letters,
-   * digits, `_`, and `-`. Empty lets the Host derive it from the tool's
-   * id, as `url_fetch` from `url/fetch`.
+   * The name a model calls the tool by: 1 to `RV_MAX_NAME` bytes of
+   * ASCII letters, digits, `_`, and `-`. Empty lets the Host derive it
+   * from the tool's id, as `url_fetch` from `url/fetch`.
    */
   struct RvStr wire_name;
   /**
-   * What the tool does, for a model to read: non-empty, at most 65536
-   * bytes.
+   * What the tool does, for a model to read: non-empty, at most
+   * `RV_MAX_TOOL_TEXT` bytes.
    */
   struct RvStr description;
   /**
    * The tool's parameters: the JSON text of a JSON Schema whose value is
-   * an object, at most 65536 bytes.
+   * an object, at most `RV_MAX_TOOL_TEXT` bytes.
    */
   struct RvStr parameters;
 };
@@ -455,7 +482,7 @@ struct RvToolResult {
   RvResultKind kind;
   /**
    * The call's output when it succeeded, and otherwise a message a model
-   * can read that says what went wrong: at most 16777216 bytes.
+   * can read that says what went wrong: at most `RV_MAX_RESULT` bytes.
    */
   struct RvStr text;
 };
@@ -503,8 +530,8 @@ struct RvLoadArgs {
    */
   void *ctx;
   /**
-   * Declines the load, at most once, with a UTF-8 reason of at most 1024
-   * bytes; returns `RV_ERR_REFUSED`.
+   * Declines the load, at most once, with a UTF-8 reason of at most
+   * `RV_MAX_LINE` bytes; returns `RV_ERR_REFUSED`.
    */
   RvStatus (*refuse)(void *ctx, struct RvStr reason);
   /**
@@ -543,7 +570,7 @@ struct RvPackNewArgs {
   struct RvStr pack;
   /**
    * Declines to make the instance, at most once, with a UTF-8 reason of
-   * at most 1024 bytes that a model can read; returns
+   * at most `RV_MAX_LINE` bytes that a model can read; returns
    * `RV_ERR_REFUSED`. The run then goes without the Pack.
    */
   RvStatus (*refuse)(void *ctx, struct RvStr reason);
@@ -587,8 +614,9 @@ struct RvToolCallArgs {
    */
   RvStatus (*finish)(void *ctx, const struct RvToolResult *result);
   /**
-   * Says what `path` names. Fills `stat`. A path longer than 4096 bytes
-   * is a misuse, here and in the two functions below.
+   * Says what `path` names. Fills `stat`. A path longer than
+   * `RV_MAX_PATH` bytes is a misuse, here and in the two functions
+   * below.
    */
   RvStatus (*file_stat)(void *ctx, struct RvStr path, struct RvStat *stat, struct RvFileError *error);
   /**

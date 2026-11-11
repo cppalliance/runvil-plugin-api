@@ -6,24 +6,21 @@
 use std::ffi::c_void;
 
 use runvil_plugin_sys::{
-    RV_ERR_FILE, RV_OK, RvBytes, RvDirEntries, RvDirEntry, RvFileError, RvStat, RvStatus, RvStr,
+    RV_ERR_FILE, RV_MAX_PATH, RV_OK, RvBytes, RvDirEntries, RvDirEntry, RvFileError, RvStat,
+    RvStatus, RvStr,
 };
 
 use super::session::{Field, Out, TOOL_CALL, answer, field, out};
 use crate::entry::rv_str;
-use crate::names::MAX_PATH;
 use crate::{DirEntry, FileError, Stat};
 
-const PATH: Field = field!("the path", 4096);
+const PATH: Field = field!("the path", 4096, RV_MAX_PATH);
 const STAT: Out = out!("file_stat", "stat");
 const STAT_ERROR: Out = out!("file_stat", "error");
 const ENTRIES: Out = out!("file_list", "entries");
 const LIST_ERROR: Out = out!("file_list", "error");
 const BYTES: Out = out!("file_read", "bytes");
 const READ_ERROR: Out = out!("file_read", "error");
-
-// The literal above is the contract's bound on a path.
-const _: () = assert!(MAX_PATH == 4096);
 
 /// What a step's last file function handed the Plugin. The contract
 /// keeps it valid until the step's next file function, so each one
@@ -99,7 +96,7 @@ fn raw_stat(stat: Stat) -> RvStat {
     RvStat {
         file_type: stat.file_type.raw(),
         reserved: 0,
-        len: stat.size,
+        len: stat.len,
     }
 }
 

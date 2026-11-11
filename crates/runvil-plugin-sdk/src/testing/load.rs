@@ -4,20 +4,22 @@
 
 use std::ffi::c_void;
 
-use runvil_plugin_sys::{RV_OK, RvPackInfo, RvPluginInfo, RvStatus, RvStr};
+use runvil_plugin_sys::{
+    RV_MAX_LINE, RV_MAX_NAME, RV_OK, RvPackInfo, RvPluginInfo, RvStatus, RvStr,
+};
 
 use super::InsertedPack;
 use super::session::{self, Described, Field, LOAD, Shape, answer, field, shape};
 use crate::names::{has_control, is_valid_name, is_valid_pack_name, is_valid_version};
 
 const PLUGIN_INFO: Shape = shape!("describe_plugin", "info", "RvPluginInfo");
-const NAME: Field = field!("the name", 64);
-const VERSION: Field = field!("the version", 64);
+const NAME: Field = field!("the name", 64, RV_MAX_NAME);
+const VERSION: Field = field!("the version", 64, RV_MAX_NAME);
 
 const PACK_INFO: Shape = shape!("insert_pack", "info", "RvPackInfo");
-/// Two segments of 64 bytes and the `/` between them.
-const PACK_NAME: Field = field!("the Pack's name", 129);
-const PACK_DESCRIPTION: Field = field!("the Pack's description", 1024);
+/// Two name segments and the `/` between them.
+const PACK_NAME: Field = field!("the Pack's name", 129, 2 * RV_MAX_NAME + 1);
+const PACK_DESCRIPTION: Field = field!("the Pack's description", 1024, RV_MAX_LINE);
 
 /// What a zero `reserved` field holding anything else is called.
 pub(super) const RESERVED: &str = "the info's reserved field is not zero";

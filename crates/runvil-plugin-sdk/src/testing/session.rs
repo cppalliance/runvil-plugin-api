@@ -8,7 +8,7 @@ use std::mem::size_of;
 use std::sync::Arc;
 use std::{ptr, slice};
 
-use runvil_plugin_sys::{RV_ERR_MISUSE, RV_ERR_REFUSED, RV_OK, RvStatus, RvStr};
+use runvil_plugin_sys::{RV_ERR_MISUSE, RV_ERR_REFUSED, RV_MAX_LINE, RV_OK, RvStatus, RvStr};
 
 use super::file::Lent;
 use super::{Failure, Files, InsertedPack};
@@ -226,20 +226,23 @@ pub(super) struct Field {
 }
 
 /// The [`Field`] of the string `$what` names, bounded at `$cap` bytes.
+/// The number is a literal, because it is part of the text of a misuse. A
+/// third argument is the contract's limit, which the number must equal.
 macro_rules! field {
-    ($what:literal, $cap:literal) => {
+    ($what:literal, $cap:literal $(, $limit:expr)?) => {{
+        $(const _: () = assert!($cap == $limit);)?
         $crate::testing::session::Field::new(
             $cap,
             concat!($what, " is longer than ", $cap, " bytes"),
             concat!($what, " has a NULL pointer and a nonzero length"),
             concat!($what, " is not UTF-8"),
         )
-    };
+    }};
 }
 pub(super) use field;
 
 /// A refusal's reason.
-const REASON: Field = field!("the refusal reason", 1024);
+const REASON: Field = field!("the refusal reason", 1024, RV_MAX_LINE);
 
 impl Field {
     /// A field bounded at `cap` bytes, with the name of each breach.

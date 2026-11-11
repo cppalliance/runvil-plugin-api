@@ -8,14 +8,14 @@ use std::sync::atomic::Ordering;
 use std::task::{Context, Poll, Waker};
 
 use runvil_plugin_sys::{
-    RV_ERR_MISUSE, RV_OK, RV_PENDING, RV_RESULT_BACKEND, RV_RESULT_INVALID_ARGUMENTS,
-    RV_RESULT_OTHER, RV_RESULT_TRANSPORT, RV_RESULT_TRUSTED, RV_RESULT_UNTRUSTED, RvCall,
-    RvResultKind, RvStatus, RvToolCallArgs, RvToolResult,
+    RV_ERR_MISUSE, RV_MAX_RESULT, RV_OK, RV_PENDING, RV_RESULT_BACKEND,
+    RV_RESULT_INVALID_ARGUMENTS, RV_RESULT_OTHER, RV_RESULT_TRANSPORT, RV_RESULT_TRUSTED,
+    RV_RESULT_UNTRUSTED, RvCall, RvResultKind, RvStatus, RvToolCallArgs, RvToolResult,
 };
 
 use super::pack::pack_of;
 use super::{args, contain, panic_message, read_str, rv_str, size_field};
-use crate::names::{MAX_RESULT, cut};
+use crate::names::cut;
 use crate::tool::CallState;
 use crate::{BoxFuture, Pack, ToolCall, ToolError, ToolErrorKind, ToolOutput};
 
@@ -187,16 +187,16 @@ unsafe fn start(call: *mut RvCall, args: &RvToolCallArgs) -> Result<Box<Call>, R
 unsafe fn finish(args: &RvToolCallArgs, result: &Result<ToolOutput, ToolError>) -> RvStatus {
     let too_long;
     let (kind, text) = match result {
-        Ok(output) if output.text().len() > MAX_RESULT => {
+        Ok(output) if output.text().len() > RV_MAX_RESULT => {
             too_long = format!(
-                "the tool's output is {} bytes, and a result holds at most {MAX_RESULT} bytes",
+                "the tool's output is {} bytes, and a result holds at most {RV_MAX_RESULT} bytes",
                 output.text().len()
             );
             (RV_RESULT_OTHER, too_long.as_str())
         }
         Ok(output) if output.is_trusted() => (RV_RESULT_TRUSTED, output.text()),
         Ok(output) => (RV_RESULT_UNTRUSTED, output.text()),
-        Err(error) => (kind_of(error.kind()), cut(error.message(), MAX_RESULT)),
+        Err(error) => (kind_of(error.kind()), cut(error.message(), RV_MAX_RESULT)),
     };
     let result = RvToolResult {
         size: size_field::<RvToolResult>(),
@@ -243,10 +243,11 @@ mod tests {
     use std::ptr;
     use std::sync::atomic::{AtomicIsize, AtomicUsize, Ordering};
 
-    use runvil_plugin_sys::{RV_ERR_MISUSE, RV_OK, RV_TOOL_CALL, RV_TOOL_CANCEL, RvCall};
+    use runvil_plugin_sys::{
+        RV_ERR_MISUSE, RV_MAX_RESULT, RV_OK, RV_TOOL_CALL, RV_TOOL_CANCEL, RvCall,
+    };
 
     use crate::entry::{entry, size_field};
-    use crate::names::MAX_RESULT;
     use crate::testing;
     use crate::{
         BoxFuture, Pack, PackInfo, Plugin, Refusal, ToolCall, ToolError, ToolErrorKind, ToolInfo,
@@ -342,7 +343,7 @@ mod tests {
                         COUNTED_STEPS.fetch_add(1, Ordering::SeqCst);
                         Ok(ToolOutput::trusted("counted"))
                     }
-                    "huge" => Ok(ToolOutput::trusted("a".repeat(MAX_RESULT + 1))),
+                    "huge" => Ok(ToolOutput::trusted("a".repeat(RV_MAX_RESULT + 1))),
                     _ => panic!("boom"),
                 }
             })

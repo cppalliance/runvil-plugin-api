@@ -4,20 +4,17 @@
 use std::ffi::c_void;
 
 use runvil_plugin_sys::{
-    RV_OK, RV_PENDING, RV_RESULT_BACKEND, RV_RESULT_INVALID_ARGUMENTS, RV_RESULT_OTHER,
-    RV_RESULT_TRANSPORT, RV_RESULT_TRUSTED, RV_RESULT_UNTRUSTED, RvStatus, RvToolResult,
+    RV_MAX_RESULT, RV_OK, RV_PENDING, RV_RESULT_BACKEND, RV_RESULT_INVALID_ARGUMENTS,
+    RV_RESULT_OTHER, RV_RESULT_TRANSPORT, RV_RESULT_TRUSTED, RV_RESULT_UNTRUSTED, RvStatus,
+    RvToolResult,
 };
 
 use super::session::{Field, Session, Shape, TOOL_CALL, answer, field, shape};
 use super::{Failure, ToolResult};
-use crate::names::MAX_RESULT;
 use crate::{ToolError, ToolErrorKind, ToolOutput};
 
 const RESULT: Shape = shape!("finish", "result", "RvToolResult");
-const TEXT: Field = field!("the result's text", 16_777_216);
-
-// The literal above is the contract's bound on a result's text.
-const _: () = assert!(MAX_RESULT == 16_777_216);
+const TEXT: Field = field!("the result's text", 16_777_216, RV_MAX_RESULT);
 
 /// Records the result a step ends its call with, validated; returns
 /// `RV_OK` or `RV_ERR_MISUSE`.

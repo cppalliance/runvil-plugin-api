@@ -4,7 +4,7 @@
 
 use std::ffi::c_void;
 
-use runvil_plugin_sys::{RV_OK, RvStatus, RvStr, RvToolInfo};
+use runvil_plugin_sys::{RV_MAX_NAME, RV_MAX_TOOL_TEXT, RV_OK, RvStatus, RvStr, RvToolInfo};
 
 use super::json;
 use super::load::RESERVED;
@@ -13,10 +13,10 @@ use crate::ToolInfo;
 use crate::names::{is_valid_name, is_valid_wire_name};
 
 const TOOL_INFO: Shape = shape!("add_tool", "info", "RvToolInfo");
-const TOOL_NAME: Field = field!("the tool's name", 64);
-const WIRE_NAME: Field = field!("the tool's wire name", 64);
-const DESCRIPTION: Field = field!("the tool's description", 65536);
-const PARAMETERS: Field = field!("the tool's parameter schema", 65536);
+const TOOL_NAME: Field = field!("the tool's name", 64, RV_MAX_NAME);
+const WIRE_NAME: Field = field!("the tool's wire name", 64, RV_MAX_NAME);
+const DESCRIPTION: Field = field!("the tool's description", 65536, RV_MAX_TOOL_TEXT);
+const PARAMETERS: Field = field!("the tool's parameter schema", 65536, RV_MAX_TOOL_TEXT);
 
 /// Records the Plugin's refusal to make a Pack instance.
 pub(super) unsafe extern "C" fn refuse(ctx: *mut c_void, reason: RvStr) -> RvStatus {

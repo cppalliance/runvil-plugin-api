@@ -57,14 +57,14 @@ pub struct Stat {
     pub file_type: FileType,
     /// The length of a file in bytes. For anything but a file it says
     /// nothing.
-    pub size: u64,
+    pub len: u64,
 }
 
 impl Stat {
-    /// The metadata of something of `file_type` that is `size` bytes long.
+    /// The metadata of something of `file_type` that is `len` bytes long.
     #[must_use]
-    pub fn new(file_type: FileType, size: u64) -> Stat {
-        Stat { file_type, size }
+    pub fn new(file_type: FileType, len: u64) -> Stat {
+        Stat { file_type, len }
     }
 }
 
@@ -219,7 +219,7 @@ mod tests {
         let entry = DirEntry::new("a.txt", Stat::new(FileType::File, 3));
         assert_eq!(entry.name, "a.txt");
         assert_eq!(entry.stat.file_type, FileType::File);
-        assert_eq!(entry.stat.size, 3);
+        assert_eq!(entry.stat.len, 3);
     }
 
     #[test]

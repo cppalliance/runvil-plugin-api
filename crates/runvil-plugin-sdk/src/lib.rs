@@ -159,7 +159,7 @@ pub struct Refusal {
 
 impl Refusal {
     /// The contract's bound on a reason, in bytes.
-    pub const MAX_REASON: usize = names::MAX_LINE;
+    pub const MAX_REASON: usize = runvil_plugin_sys::RV_MAX_LINE;
 
     /// A refusal with `reason`, cut to [`Refusal::MAX_REASON`] bytes at a
     /// character boundary, because the Host rejects a longer reason as a

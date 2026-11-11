@@ -18,7 +18,9 @@
 //!   the Host speaks. Each function a Plugin may call back belongs to one
 //!   verb and sits in that verb's arguments struct, behind `call->args`,
 //!   beside the `ctx` pointer it takes first.
-//! - Strings are a pointer plus a length, UTF-8, not NUL-terminated.
+//! - Strings are a pointer plus a length, UTF-8, not NUL-terminated. Each
+//!   string a Plugin passes has a limit in bytes, which one of the
+//!   `RV_MAX_` constants names, and a longer string is a misuse.
 //! - A struct or a string that one side passes to the other is valid only
 //!   until the function it was passed to returns. The receiver copies what
 //!   it keeps. What a file function hands back stays valid until the next
@@ -86,11 +88,11 @@
 //!   the run's policy applies to every read. This version has no function
 //!   that changes a file.
 //! - A path names a file of the run, with `/` between its segments, and is
-//!   at most 4096 bytes long. Every path is taken from the run's root,
-//!   whether or not it begins with `/`. An empty segment and a `.` segment
-//!   change nothing, a `..` segment steps up one directory, and a `\` is
-//!   read as `/`. An empty path, and a path that steps above the root,
-//!   fail as file errors.
+//!   at most [`RV_MAX_PATH`] bytes long. Every path is taken from the run's
+//!   root, whether or not it begins with `/`. An empty segment and a `.`
+//!   segment change nothing, a `..` segment steps up one directory, and a
+//!   `\` is read as `/`. An empty path, and a path that steps above the
+//!   root, fail as file errors.
 //! - `file_stat`, and each entry `file_list` hands back, describe a link
 //!   and not what it leads to. `file_list` and `file_read` act on what a
 //!   link leads to.
@@ -308,6 +310,17 @@ pub const RV_API_MAJOR: u32 = 0;
 /// The contract's minor version, which [`RvHost`] reports.
 pub const RV_API_MINOR: u32 = 4;
 
+/// The most bytes in a name segment, a version, or a wire name.
+pub const RV_MAX_NAME: usize = 64;
+/// The most bytes in a refusal reason or a Pack's description.
+pub const RV_MAX_LINE: usize = 1024;
+/// The most bytes in a path a file function takes.
+pub const RV_MAX_PATH: usize = 4096;
+/// The most bytes in a tool's description, and in its parameters.
+pub const RV_MAX_TOOL_TEXT: usize = 65536;
+/// The most bytes in the text of a tool call's result.
+pub const RV_MAX_RESULT: usize = 16_777_216;
+
 /// A UTF-8 string that is not NUL-terminated.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
@@ -383,10 +396,10 @@ pub struct RvPluginInfo {
     pub size: u32,
     /// Zero.
     pub reserved: u32,
-    /// 1 to 64 bytes of lowercase ASCII letters, digits, `-`, `_`, and `.`:
-    /// one name segment, such as `acme-url`.
+    /// One name segment, such as `acme-url`: 1 to [`RV_MAX_NAME`] bytes of
+    /// lowercase ASCII letters, digits, `-`, `_`, and `.`.
     pub name: RvStr,
-    /// Non-empty, at most 64 bytes, with no control characters.
+    /// Non-empty, at most [`RV_MAX_NAME`] bytes, with no control characters.
     pub version: RvStr,
 }
 
@@ -401,8 +414,8 @@ pub struct RvPackInfo {
     /// The Pack's name: a vendor and a Pack id joined by `/`, such as
     /// `acme/url`. Each is one name segment, as a Plugin's name is.
     pub name: RvStr,
-    /// One line saying what the Pack offers: at most 1024 bytes with no
-    /// control characters. It may be empty.
+    /// One line saying what the Pack offers: at most [`RV_MAX_LINE`] bytes
+    /// with no control characters. It may be empty.
     pub description: RvStr,
 }
 
@@ -416,15 +429,15 @@ pub struct RvToolInfo {
     pub reserved: u32,
     /// The tool's name within its Pack: one name segment, such as `fetch`.
     pub name: RvStr,
-    /// The name a model calls the tool by: 1 to 64 bytes of ASCII letters,
-    /// digits, `_`, and `-`. Empty lets the Host derive it from the tool's
-    /// id, as `url_fetch` from `url/fetch`.
+    /// The name a model calls the tool by: 1 to [`RV_MAX_NAME`] bytes of
+    /// ASCII letters, digits, `_`, and `-`. Empty lets the Host derive it
+    /// from the tool's id, as `url_fetch` from `url/fetch`.
     pub wire_name: RvStr,
-    /// What the tool does, for a model to read: non-empty, at most 65536
-    /// bytes.
+    /// What the tool does, for a model to read: non-empty, at most
+    /// [`RV_MAX_TOOL_TEXT`] bytes.
     pub description: RvStr,
     /// The tool's parameters: the JSON text of a JSON Schema whose value is
-    /// an object, at most 65536 bytes.
+    /// an object, at most [`RV_MAX_TOOL_TEXT`] bytes.
     pub parameters: RvStr,
 }
 
@@ -438,7 +451,7 @@ pub struct RvToolResult {
     /// or else why it failed: one of the `RV_RESULT_` constants.
     pub kind: RvResultKind,
     /// The call's output when it succeeded, and otherwise a message a model
-    /// can read that says what went wrong: at most 16777216 bytes.
+    /// can read that says what went wrong: at most [`RV_MAX_RESULT`] bytes.
     pub text: RvStr,
 }
 
@@ -470,8 +483,8 @@ pub struct RvLoadArgs {
     /// The Host's context for this load, passed back as the first argument
     /// of each function below. The Plugin never reads through it.
     pub ctx: *mut c_void,
-    /// Declines the load, at most once, with a UTF-8 reason of at most 1024
-    /// bytes; returns [`RV_ERR_REFUSED`].
+    /// Declines the load, at most once, with a UTF-8 reason of at most
+    /// [`RV_MAX_LINE`] bytes; returns [`RV_ERR_REFUSED`].
     pub refuse: unsafe extern "C" fn(ctx: *mut c_void, reason: RvStr) -> RvStatus,
     /// Names the Plugin, exactly once.
     pub describe_plugin:
@@ -497,7 +510,7 @@ pub struct RvPackNewArgs {
     /// The name of the Pack, as the Plugin gave it to `insert_pack`.
     pub pack: RvStr,
     /// Declines to make the instance, at most once, with a UTF-8 reason of
-    /// at most 1024 bytes that a model can read; returns
+    /// at most [`RV_MAX_LINE`] bytes that a model can read; returns
     /// [`RV_ERR_REFUSED`]. The run then goes without the Pack.
     pub refuse: unsafe extern "C" fn(ctx: *mut c_void, reason: RvStr) -> RvStatus,
     /// Adds one tool to the instance, once for each tool it offers. No two
@@ -525,8 +538,9 @@ pub struct RvToolCallArgs {
     /// Ends the call with its result, exactly once, in the step that then
     /// returns [`RV_OK`].
     pub finish: unsafe extern "C" fn(ctx: *mut c_void, result: *const RvToolResult) -> RvStatus,
-    /// Says what `path` names. Fills `stat`. A path longer than 4096 bytes
-    /// is a misuse, here and in the two functions below.
+    /// Says what `path` names. Fills `stat`. A path longer than
+    /// [`RV_MAX_PATH`] bytes is a misuse, here and in the two functions
+    /// below.
     pub file_stat: unsafe extern "C" fn(
         ctx: *mut c_void,
         path: RvStr,
@@ -600,7 +614,8 @@ mod tests {
         RV_FILE_ERROR_CONFLICT, RV_FILE_ERROR_DENIED, RV_FILE_ERROR_IO,
         RV_FILE_ERROR_IS_A_DIRECTORY, RV_FILE_ERROR_NOT_A_DIRECTORY, RV_FILE_ERROR_NOT_FOUND,
         RV_FILE_ERROR_OTHER, RV_FILE_TYPE_DIRECTORY, RV_FILE_TYPE_FILE, RV_FILE_TYPE_OTHER,
-        RV_FILE_TYPE_SYMLINK, RV_OK, RV_PACK_DELETE, RV_PACK_NEW, RV_PENDING, RV_PLUGIN_LOAD,
+        RV_FILE_TYPE_SYMLINK, RV_MAX_LINE, RV_MAX_NAME, RV_MAX_PATH, RV_MAX_RESULT,
+        RV_MAX_TOOL_TEXT, RV_OK, RV_PACK_DELETE, RV_PACK_NEW, RV_PENDING, RV_PLUGIN_LOAD,
         RV_PLUGIN_UNLOAD, RV_RESULT_BACKEND, RV_RESULT_INVALID_ARGUMENTS, RV_RESULT_OTHER,
         RV_RESULT_TRANSPORT, RV_RESULT_TRUSTED, RV_RESULT_UNTRUSTED, RV_TOOL_CALL, RV_TOOL_CANCEL,
     };
@@ -755,6 +770,15 @@ mod tests {
         assert_eq!(RV_ERR_UNSUPPORTED, 6);
         assert_eq!(RV_PENDING, 7);
         assert_eq!(RV_ERR_FILE, 8);
+    }
+
+    #[test]
+    fn the_byte_limits_keep_their_numbers() {
+        assert_eq!(RV_MAX_NAME, 64);
+        assert_eq!(RV_MAX_LINE, 1024);
+        assert_eq!(RV_MAX_PATH, 4096);
+        assert_eq!(RV_MAX_TOOL_TEXT, 65536);
+        assert_eq!(RV_MAX_RESULT, 16_777_216);
     }
 
     #[test]

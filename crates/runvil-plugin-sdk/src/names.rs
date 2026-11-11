@@ -1,21 +1,9 @@
 //! The rules the Harness applies to the names and texts a Plugin hands
-//! it, and the contract's bounds on them. The rules are `const fn`s, so
+//! it, under the contract's limits on them. The rules are `const fn`s, so
 //! [`entry`](crate::entry) can check a Plugin's constants when it is
 //! compiled.
 
-/// The contract's bound on a name segment, a version, and a wire name, in
-/// bytes.
-pub(crate) const MAX_LEN: usize = 64;
-
-/// The contract's bound on a refusal reason and on a Pack's description,
-/// in bytes.
-pub(crate) const MAX_LINE: usize = 1024;
-
-/// The contract's bound on a tool result's text, in bytes.
-pub(crate) const MAX_RESULT: usize = 16_777_216;
-
-/// The contract's bound on a path a file function takes, in bytes.
-pub(crate) const MAX_PATH: usize = 4096;
+use runvil_plugin_sys::{RV_MAX_LINE, RV_MAX_NAME};
 
 /// Whether `name` is one name segment the Harness accepts: 1 to 64 bytes
 /// of lowercase ASCII letters, digits, `-`, `_`, and `.`.
@@ -36,7 +24,7 @@ pub(crate) const fn is_valid_pack_name(name: &str) -> bool {
 
 /// Whether `bytes[from..to]` is one name segment.
 const fn is_segment(bytes: &[u8], from: usize, to: usize) -> bool {
-    if to <= from || to - from > MAX_LEN {
+    if to <= from || to - from > RV_MAX_NAME {
         return false;
     }
     let mut at = from;
@@ -54,7 +42,7 @@ const fn is_segment(bytes: &[u8], from: usize, to: usize) -> bool {
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) const fn is_valid_wire_name(name: &str) -> bool {
     let bytes = name.as_bytes();
-    if bytes.is_empty() || bytes.len() > MAX_LEN {
+    if bytes.is_empty() || bytes.len() > RV_MAX_NAME {
         return false;
     }
     let mut at = 0;
@@ -70,13 +58,13 @@ pub(crate) const fn is_valid_wire_name(name: &str) -> bool {
 /// Whether `version` is a version the Harness accepts: 1 to 64 bytes with
 /// no control character.
 pub(crate) const fn is_valid_version(version: &str) -> bool {
-    !version.is_empty() && version.len() <= MAX_LEN && !has_control(version)
+    !version.is_empty() && version.len() <= RV_MAX_NAME && !has_control(version)
 }
 
 /// Whether `description` is a Pack description the Harness accepts: at
 /// most 1024 bytes with no control character. It may be empty.
 pub(crate) const fn is_valid_description(description: &str) -> bool {
-    description.len() <= MAX_LINE && !has_control(description)
+    description.len() <= RV_MAX_LINE && !has_control(description)
 }
 
 /// Whether `text` holds a control character, which `char::is_control`
@@ -125,9 +113,11 @@ pub(crate) const fn same(a: &str, b: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use runvil_plugin_sys::{RV_MAX_LINE, RV_MAX_NAME};
+
     use super::{
-        MAX_LEN, MAX_LINE, cut, has_control, is_valid_description, is_valid_name,
-        is_valid_pack_name, is_valid_version, is_valid_wire_name, same,
+        cut, has_control, is_valid_description, is_valid_name, is_valid_pack_name,
+        is_valid_version, is_valid_wire_name, same,
     };
 
     #[test]
@@ -151,8 +141,8 @@ mod tests {
 
     #[test]
     fn a_name_is_at_most_64_bytes() {
-        assert!(is_valid_name(&"a".repeat(MAX_LEN)));
-        assert!(!is_valid_name(&"a".repeat(MAX_LEN + 1)));
+        assert!(is_valid_name(&"a".repeat(RV_MAX_NAME)));
+        assert!(!is_valid_name(&"a".repeat(RV_MAX_NAME + 1)));
     }
 
     #[test]
@@ -177,7 +167,7 @@ mod tests {
 
     #[test]
     fn each_segment_of_a_pack_name_is_at_most_64_bytes() {
-        let long = "a".repeat(MAX_LEN);
+        let long = "a".repeat(RV_MAX_NAME);
         assert!(is_valid_pack_name(&format!("{long}/{long}")));
         assert!(!is_valid_pack_name(&format!("{long}a/{long}")));
         assert!(!is_valid_pack_name(&format!("{long}/{long}a")));
@@ -191,8 +181,8 @@ mod tests {
         for name in ["", "web/fetch", "a.b", "a b", "café"] {
             assert!(!is_valid_wire_name(name), "{name:?}");
         }
-        assert!(is_valid_wire_name(&"a".repeat(MAX_LEN)));
-        assert!(!is_valid_wire_name(&"a".repeat(MAX_LEN + 1)));
+        assert!(is_valid_wire_name(&"a".repeat(RV_MAX_NAME)));
+        assert!(!is_valid_wire_name(&"a".repeat(RV_MAX_NAME + 1)));
     }
 
     #[test]
@@ -218,16 +208,16 @@ mod tests {
 
     #[test]
     fn a_version_is_at_most_64_bytes() {
-        assert!(is_valid_version(&"1".repeat(MAX_LEN)));
-        assert!(!is_valid_version(&"1".repeat(MAX_LEN + 1)));
+        assert!(is_valid_version(&"1".repeat(RV_MAX_NAME)));
+        assert!(!is_valid_version(&"1".repeat(RV_MAX_NAME + 1)));
     }
 
     #[test]
     fn a_description_is_one_line_of_at_most_1024_bytes_and_may_be_empty() {
         assert!(is_valid_description(""));
         assert!(is_valid_description("Greets a person by name"));
-        assert!(is_valid_description(&"a".repeat(MAX_LINE)));
-        assert!(!is_valid_description(&"a".repeat(MAX_LINE + 1)));
+        assert!(is_valid_description(&"a".repeat(RV_MAX_LINE)));
+        assert!(!is_valid_description(&"a".repeat(RV_MAX_LINE + 1)));
         assert!(!is_valid_description("two\nlines"));
     }
 

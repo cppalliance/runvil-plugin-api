@@ -130,6 +130,11 @@ static const RvLayoutEntry ENTRIES[] = {
     VALUE(RV_FILE_ERROR_IO),
     VALUE(RV_API_MAJOR),
     VALUE(RV_API_MINOR),
+    VALUE(RV_MAX_NAME),
+    VALUE(RV_MAX_LINE),
+    VALUE(RV_MAX_PATH),
+    VALUE(RV_MAX_TOOL_TEXT),
+    VALUE(RV_MAX_RESULT),
 };
 
 /* The table above, and its length through `count`. */
