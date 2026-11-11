@@ -1,5 +1,5 @@
-//! The function a fake Host's `RvToolCallArgs` carries, `finish`, and
-//! how the Harness judges what a step did.
+//! The function a fake Host's `RvToolCallArgs` carries to end a call,
+//! `finish`, and how the Harness judges what a step did.
 
 use std::ffi::c_void;
 
@@ -147,7 +147,9 @@ mod tests {
         for (breach, failure, cancels) in [
             (
                 Breach::FinishCtx,
-                Failure::Misused("finish was handed a ctx other than the open RV_TOOL_CALL step's"),
+                Failure::Misused(
+                    "a tool call function was handed a ctx other than the open RV_TOOL_CALL step's",
+                ),
                 0,
             ),
             (

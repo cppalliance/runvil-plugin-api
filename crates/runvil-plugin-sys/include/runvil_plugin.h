@@ -28,7 +28,8 @@
  * - Strings are a pointer plus a length, UTF-8, not NUL-terminated.
  * - A struct or a string that one side passes to the other is valid only
  *   until the function it was passed to returns. The receiver copies what
- *   it keeps.
+ *   it keeps. What a file function hands back stays valid a little
+ *   longer, as the section on files says.
  * - Verb names follow `RV_<OBJECT>_<ACTION>`. Libraries open and close;
  *   Plugins load and unload.
  *
@@ -82,6 +83,31 @@
  *   for long, or blocks, stalls its run, and a run can be canceled only
  *   between steps. `RV_PENDING` is not a way to wait: the Host sends the
  *   next step as soon as the run's other work has had a turn.
+ *
+ * # Files
+ *
+ * - A step reads the files of its run through the three file functions
+ *   in its `RvToolCallArgs`: `file_stat`, `file_list`, and `file_read`.
+ *   They are how a tool reaches a run's files, so the run's policy applies
+ *   to every read. This version has no function that changes a file.
+ * - A path names a file of the run, with `/` between its segments. A path
+ *   that does not begin with `/` is taken from the run's root.
+ * - `file_stat`, and each entry `file_list` hands back, describe a link
+ *   and not what it leads to. `file_list` and `file_read` act on what a
+ *   link leads to.
+ * - The Plugin passes each file function a struct for its result and an
+ *   `RvFileError`, both its own. The function returns `RV_OK` and
+ *   fills the result, or returns `RV_ERR_FILE` and fills the error. A
+ *   file function that fails does not fail the tool call: the tool
+ *   decides what its result says.
+ * - What a file function hands back through those structs belongs to the
+ *   Host: the bytes, the entries and the names in them, and an error's
+ *   text. Each stays valid until the next file function called through
+ *   the same `ctx`, or until the step returns, whichever comes first. The
+ *   Plugin copies what it keeps and frees none of it.
+ * - A file function returns when its operation is done. A tool that
+ *   reads many files returns `RV_PENDING` between them now and then, so
+ *   that no step works for long.
  *
  * # Threads and lifetime
  *
@@ -148,6 +174,8 @@
  * - `RV_ERR_UNSUPPORTED` (6) means the Plugin doesn't know the verb.
  * - `RV_PENDING` (7) means a tool call needs another step. Only
  *   `RV_TOOL_CALL` returns it.
+ * - `RV_ERR_FILE` (8) means a file function failed. Only a file
+ *   function returns it.
  *
  * # Versions
  *
@@ -170,6 +198,11 @@
 #include <stdint.h>
 
 typedef struct RvStr RvStr;
+typedef struct RvBytes RvBytes;
+typedef struct RvStat RvStat;
+typedef struct RvDirEntry RvDirEntry;
+typedef struct RvDirEntries RvDirEntries;
+typedef struct RvFileError RvFileError;
 typedef struct RvPluginInfo RvPluginInfo;
 typedef struct RvPackInfo RvPackInfo;
 typedef struct RvToolInfo RvToolInfo;
@@ -188,7 +221,7 @@ typedef struct RvCall RvCall;
 /**
  * The contract's minor version, which `RvHost` reports.
  */
-#define RV_API_MINOR 3
+#define RV_API_MINOR 4
 
 /**
  * What every function in the contract returns: zero for success.
@@ -208,6 +241,18 @@ typedef uint32_t RvVerb;
 typedef uint32_t RvResultKind;
 
 /**
+ * What a path names, in an `RvStat`. A fixed-width integer, as
+ * `RvVerb` is.
+ */
+typedef uint32_t RvFileType;
+
+/**
+ * Why a file function failed, in an `RvFileError`. A fixed-width
+ * integer, as `RvVerb` is.
+ */
+typedef uint32_t RvFileErrorKind;
+
+/**
  * A UTF-8 string that is not NUL-terminated.
  */
 struct RvStr {
@@ -219,6 +264,87 @@ struct RvStr {
    * The length in bytes.
    */
   size_t len;
+};
+
+/**
+ * A run of bytes, which `file_read` hands back.
+ */
+struct RvBytes {
+  /**
+   * The first byte. It may be NULL when `len` is zero.
+   */
+  const uint8_t *ptr;
+  /**
+   * The length in bytes.
+   */
+  size_t len;
+};
+
+/**
+ * What a path names, which `file_stat` fills and each `RvDirEntry` holds.
+ */
+struct RvStat {
+  /**
+   * One of the `RV_FILE_TYPE_` constants.
+   */
+  RvFileType file_type;
+  /**
+   * Zero.
+   */
+  uint32_t reserved;
+  /**
+   * The length of a file in bytes. For anything but a file the number
+   * means nothing.
+   */
+  uint64_t len;
+};
+
+/**
+ * One entry of a directory, in an `RvDirEntries`.
+ */
+struct RvDirEntry {
+  /**
+   * The entry's name within its directory.
+   */
+  struct RvStr name;
+  /**
+   * What the entry is.
+   */
+  struct RvStat stat;
+};
+
+/**
+ * The entries of a directory, in no promised order, which `file_list`
+ * hands back.
+ */
+struct RvDirEntries {
+  /**
+   * The first entry. It may be NULL when `len` is zero.
+   */
+  const struct RvDirEntry *ptr;
+  /**
+   * How many entries there are.
+   */
+  size_t len;
+};
+
+/**
+ * Why a file function failed, which the function fills when it returns
+ * `RV_ERR_FILE`.
+ */
+struct RvFileError {
+  /**
+   * One of the `RV_FILE_ERROR_` constants.
+   */
+  RvFileErrorKind kind;
+  /**
+   * Zero.
+   */
+  uint32_t reserved;
+  /**
+   * What went wrong, in words a model can read.
+   */
+  struct RvStr text;
 };
 
 /**
@@ -417,9 +543,9 @@ struct RvPackNewArgs {
 };
 
 /**
- * The arguments of `RV_TOOL_CALL`: the tool, its arguments, and the
- * function that ends the call. Every step of one call gets the same
- * `tool` and `arguments`.
+ * The arguments of `RV_TOOL_CALL`: the tool, its arguments, the
+ * function that ends the call, and the file functions. Every step of one
+ * call gets the same `tool` and `arguments`.
  */
 struct RvToolCallArgs {
   /**
@@ -432,7 +558,7 @@ struct RvToolCallArgs {
   uint32_t reserved;
   /**
    * The Host's context for this step, passed back as the first argument
-   * of the function below. The Plugin never reads through it.
+   * of each function below. The Plugin never reads through it.
    */
   void *ctx;
   /**
@@ -448,6 +574,29 @@ struct RvToolCallArgs {
    * returns `RV_OK`.
    */
   RvStatus (*finish)(void *ctx, const struct RvToolResult *result);
+  /**
+   * Says what `path`, at most 4096 bytes, names. Fills `stat`.
+   */
+  RvStatus (*file_stat)(void *ctx, struct RvStr path, struct RvStat *stat, struct RvFileError *error);
+  /**
+   * Lists the directory at `path`, at most 4096 bytes. Fills `entries`.
+   */
+  RvStatus (*file_list)(void *ctx,
+                        struct RvStr path,
+                        struct RvDirEntries *entries,
+                        struct RvFileError *error);
+  /**
+   * Reads up to `len` bytes of the file at `path`, at most 4096 bytes,
+   * from the byte `offset` on. Fills `bytes`, with fewer than `len`
+   * bytes when the file ends first, and none when `offset` is at or
+   * past its end.
+   */
+  RvStatus (*file_read)(void *ctx,
+                        struct RvStr path,
+                        uint64_t offset,
+                        uint64_t len,
+                        struct RvBytes *bytes,
+                        struct RvFileError *error);
 };
 
 /**
@@ -518,6 +667,12 @@ struct RvCall {
 #define RV_PENDING 7
 
 /**
+ * A file function failed, and its `error` says how; only a file function
+ * returns it.
+ */
+#define RV_ERR_FILE 8
+
+/**
  * Make the Plugin instance, name the Plugin, and insert its Packs.
  */
 #define RV_PLUGIN_LOAD 1
@@ -579,6 +734,65 @@ struct RvCall {
  * The call failed for any other reason.
  */
 #define RV_RESULT_OTHER 5
+
+/**
+ * Something that is none of the kinds below, such as a pipe, a socket, or
+ * a device.
+ */
+#define RV_FILE_TYPE_OTHER 0
+
+/**
+ * A regular file.
+ */
+#define RV_FILE_TYPE_FILE 1
+
+/**
+ * A directory.
+ */
+#define RV_FILE_TYPE_DIRECTORY 2
+
+/**
+ * A symbolic link.
+ */
+#define RV_FILE_TYPE_SYMLINK 3
+
+/**
+ * A reason the kinds below do not name.
+ */
+#define RV_FILE_ERROR_OTHER 0
+
+/**
+ * Nothing is at the path.
+ */
+#define RV_FILE_ERROR_NOT_FOUND 1
+
+/**
+ * The path names something that is not a directory, where the operation
+ * needs one.
+ */
+#define RV_FILE_ERROR_NOT_A_DIRECTORY 2
+
+/**
+ * The path names a directory, where the operation needs a file.
+ */
+#define RV_FILE_ERROR_IS_A_DIRECTORY 3
+
+/**
+ * The run's policy does not allow the operation. The error's text is the
+ * policy's own reason.
+ */
+#define RV_FILE_ERROR_DENIED 4
+
+/**
+ * Another tool call of the run changed the path, or is changing it, at
+ * the same time. The same operation can succeed in a later call.
+ */
+#define RV_FILE_ERROR_CONFLICT 5
+
+/**
+ * The operating system failed the operation.
+ */
+#define RV_FILE_ERROR_IO 6
 
 #ifdef __cplusplus
 extern "C" {

@@ -1,8 +1,10 @@
 //! The C entry point every [`Plugin`] gets: [`entry`], which answers each
 //! verb of the contract for the Plugin type it is instantiated with. The
 //! code of each verb sits in the child module of the object it acts on:
-//! `plugin`, `pack`, or `tool`.
+//! `plugin`, `pack`, or `tool`. The child module `file` calls the Host's
+//! file functions for a tool call.
 
+pub(crate) mod file;
 mod pack;
 mod plugin;
 mod tool;

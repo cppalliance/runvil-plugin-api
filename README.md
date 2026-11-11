@@ -34,10 +34,10 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-runvil-plugin-sdk = { git = "https://github.com/cppalliance/runvil-plugin-api", tag = "api-v0.3.0" }
+runvil-plugin-sdk = { git = "https://github.com/cppalliance/runvil-plugin-api", tag = "api-v0.4.0" }
 
 [dev-dependencies]
-runvil-plugin-sdk = { git = "https://github.com/cppalliance/runvil-plugin-api", tag = "api-v0.3.0", features = ["test-support"] }
+runvil-plugin-sdk = { git = "https://github.com/cppalliance/runvil-plugin-api", tag = "api-v0.4.0", features = ["test-support"] }
 ```
 
 `src/lib.rs`:
@@ -91,6 +91,7 @@ export_plugin!(Acme);
 - The Pack's name is a vendor and a Pack id joined by `/`. A prompt reaches the tool above as `hello/greet`, the Pack id and the tool's name.
 - Arguments and parameter schemas cross as JSON text, so the SDK needs no JSON library. A Plugin parses `call.arguments()` with one of its own.
 - A tool call is a future the Host polls once per step, and the Host sends the next step without being woken. A call that does a long job awaits `next_step()` every so often, so that no step works for long and the Host can abandon the call between two steps.
+- A tool reads the files of its run through its `ToolCall`: `stat`, `list`, `read`, and `read_range`. Each goes through the Host, so the run's policy applies to every read. A read that fails returns a `FileError` with a kind and the Host's words for what went wrong, and the call goes on, so the tool decides what the model reads. This version has no method that changes a file.
 - A panic in `load` or `new_pack` reaches the Host as a refusal, and a panic in a tool call ends that call as a failure. Neither unwinds into the Host.
 
 ### Testing
@@ -105,17 +106,28 @@ assert_eq!(pack.call("greet", "{}"), Ok(Ok(ToolOutput::trusted("Hello."))));
 
 `load` returns the Plugin's name, version, and Packs, or the failure the Harness would report. `new_pack` returns one run's instance with its tools. `call` runs a tool call to its end, and `start` hands back a call whose steps the test sends one at a time. Dropping each value sends the verb that frees what it stands for.
 
+A tool that reads files gets them from a `Files` tree held in memory:
+
+```rust
+let files = Files::new()
+    .file("/notes/a.md", "one\ntwo\n")
+    .fails("/secret", FileError::new(FileErrorKind::Denied, "the mode allows only /notes"));
+let pack = loaded.new_pack("acme/notes").unwrap().with_files(files);
+```
+
+`file` and `dir` add a node and every directory on the way to it, and `fails` makes every read of a path fail with the error given, as a path the run's policy denies does.
+
 ### Linked and library builds of one Plugin
 
 A Host can also link a Plugin crate in and hand `runvil_plugin_sdk::entry::<Acme>` to the Harness, so no symbol is exported. Two linked Plugins that both export `runvil_plugin` cannot share one binary, so a crate built both ways puts `export_plugin!` behind a feature of its own, as `examples/hello-plugin` does with `dll`.
 
 ## Writing a Plugin in C or C++
 
-Include `runvil_plugin.h` and define `RvStatus runvil_plugin(RvCall *call)`. The header's opening comment is the whole contract: the verbs, who calls what on which thread, and what the Plugin must free on every path. The functions a Plugin may call back come with the verb they serve, in its arguments struct behind `call->args` (an `RvLoadArgs` for `RV_PLUGIN_LOAD`, an `RvPackNewArgs` for `RV_PACK_NEW`, an `RvToolCallArgs` for `RV_TOOL_CALL`), and each takes that struct's `ctx` first. `tests/c-layout` compiles the header as C99 and as C++ on every CI run.
+Include `runvil_plugin.h` and define `RvStatus runvil_plugin(RvCall *call)`. The header's opening comment is the whole contract: the verbs, who calls what on which thread, and what the Plugin must free on every path. The functions a Plugin may call back come with the verb they serve, in its arguments struct behind `call->args` (an `RvLoadArgs` for `RV_PLUGIN_LOAD`, an `RvPackNewArgs` for `RV_PACK_NEW`, an `RvToolCallArgs` for `RV_TOOL_CALL`), and each takes that struct's `ctx` first. A step of a tool call reads its run's files through `file_stat`, `file_list`, and `file_read` in its `RvToolCallArgs`. `tests/c-layout` compiles the header as C99 and as C++ on every CI run.
 
 ## Versions
 
-The contract's version is `RV_API_MAJOR`.`RV_API_MINOR`, and `runvil-plugin-sys` carries the same version number. While the major version is 0, each version is its own contract, so a Plugin built for 0.3 loads only in a Host that speaks exactly 0.3. From 1.0, minor versions only add, and a Plugin built for 1.n loads in any Host that speaks 1.n or later.
+The contract's version is `RV_API_MAJOR`.`RV_API_MINOR`, and `runvil-plugin-sys` carries the same version number. While the major version is 0, each version is its own contract, so a Plugin built for 0.4 loads only in a Host that speaks exactly 0.4. From 1.0, minor versions only add, and a Plugin built for 1.n loads in any Host that speaks 1.n or later.
 
 Cargo allows one package per `links` value in a build, and `runvil-plugin-sys` sets `links = "runvil_plugin"`, so a Host can never link two versions of the contract into one binary.
 

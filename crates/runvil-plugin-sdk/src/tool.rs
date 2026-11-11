@@ -5,7 +5,13 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::AtomicPtr;
 use std::task::{Context, Poll};
+
+use runvil_plugin_sys::RvToolCallArgs;
+
+use crate::entry::file;
+use crate::{DirEntry, FileError, Stat};
 
 /// A tool described as data, which a [`Pack`](crate::Pack) lists in
 /// [`Pack::tools`](crate::Pack::tools).
@@ -54,9 +60,16 @@ impl ToolInfo {
     }
 }
 
-/// What one tool call lends its [`Pack`](crate::Pack): the tool's name
-/// and the call's arguments. It borrows from the call, so a Pack cannot
-/// keep it past the call's end.
+/// What one tool call lends its [`Pack`](crate::Pack): the tool's name,
+/// the call's arguments, and the files of the call's run. It borrows from
+/// the call, so a Pack cannot keep it past the call's end.
+///
+/// The file methods read through the Host, so the run's policy applies to
+/// every read, and a read the policy denies fails like any other. Each
+/// method returns once the Host has done the read. A path names a file of
+/// the run, with `/` between its segments, and one that does not begin
+/// with `/` is taken from the run's root. A call that reads many files
+/// awaits [`next_step`] between them every so often.
 #[derive(Clone, Copy, Debug)]
 pub struct ToolCall<'a> {
     state: &'a CallState,
@@ -81,14 +94,72 @@ impl<'a> ToolCall<'a> {
     pub fn arguments(&self) -> &'a str {
         &self.state.arguments
     }
+
+    /// What `path` names. A link is reported as a link, not as what it
+    /// leads to.
+    ///
+    /// # Errors
+    /// Returns a [`FileError`] when nothing is at `path`, when the run's
+    /// policy denies the read, or when the Host fails it.
+    pub fn stat(&self, path: &str) -> Result<Stat, FileError> {
+        file::stat(self.state, path)
+    }
+
+    /// The entries of the directory at `path`, in no promised order. An
+    /// entry that is a link is reported as a link.
+    ///
+    /// # Errors
+    /// Returns a [`FileError`] when `path` names no directory, when the
+    /// run's policy denies the read, or when the Host fails it.
+    pub fn list(&self, path: &str) -> Result<Vec<DirEntry>, FileError> {
+        file::list(self.state, path)
+    }
+
+    /// The whole contents of the file at `path`. The Host holds them in
+    /// memory, so a tool checks [`stat`](ToolCall::stat) first, or uses
+    /// [`read_range`](ToolCall::read_range), when the file may be large.
+    ///
+    /// # Errors
+    /// Returns a [`FileError`] when `path` names no file, when the run's
+    /// policy denies the read, or when the Host fails it.
+    pub fn read(&self, path: &str) -> Result<Vec<u8>, FileError> {
+        file::read(self.state, path, 0, u64::MAX)
+    }
+
+    /// Up to `len` bytes of the file at `path`, from the byte `offset`
+    /// on: fewer when the file ends first, and none when `offset` is at
+    /// or past its end.
+    ///
+    /// # Errors
+    /// Returns a [`FileError`] when `path` names no file, when the run's
+    /// policy denies the read, or when the Host fails it.
+    pub fn read_range(&self, path: &str, offset: u64, len: u64) -> Result<Vec<u8>, FileError> {
+        file::read(self.state, path, offset, len)
+    }
 }
 
 /// What one tool call keeps for all of its steps: the copies of its tool
-/// name and arguments that a [`ToolCall`] reads.
+/// name and arguments that a [`ToolCall`] reads, and the step that is
+/// running.
 #[derive(Debug)]
 pub(crate) struct CallState {
     pub(crate) tool: String,
     pub(crate) arguments: String,
+    /// The arguments of the step that is running, which hold the Host's
+    /// file functions, or NULL between two steps.
+    pub(crate) step: AtomicPtr<RvToolCallArgs>,
+}
+
+impl CallState {
+    /// The state of a call of `tool` with `arguments`, with no step
+    /// running.
+    pub(crate) fn new(tool: &str, arguments: &str) -> CallState {
+        CallState {
+            tool: tool.to_owned(),
+            arguments: arguments.to_owned(),
+            step: AtomicPtr::new(std::ptr::null_mut()),
+        }
+    }
 }
 
 /// The text a successful tool call returns, and whether the Plugin
@@ -224,6 +295,7 @@ mod tests {
     use std::task::{Context, Poll, Waker};
 
     use super::{CallState, ToolCall, ToolError, ToolErrorKind, ToolInfo, ToolOutput, next_step};
+    use crate::{FileError, FileErrorKind};
 
     #[test]
     fn a_tool_info_keeps_what_it_was_built_from_and_has_no_wire_name_until_one_is_set() {
@@ -237,13 +309,24 @@ mod tests {
 
     #[test]
     fn a_tool_call_lends_the_tool_name_and_the_arguments() {
-        let state = CallState {
-            tool: "fetch".to_owned(),
-            arguments: r#"{"url":"x"}"#.to_owned(),
-        };
+        let state = CallState::new("fetch", r#"{"url":"x"}"#);
         let call = ToolCall::new(&state);
         assert_eq!(call.tool(), "fetch");
         assert_eq!(call.arguments(), r#"{"url":"x"}"#);
+    }
+
+    #[test]
+    fn a_file_method_fails_while_no_step_of_its_call_runs() {
+        let state = CallState::new("fetch", "{}");
+        let call = ToolCall::new(&state);
+        let outside = FileError::new(
+            FileErrorKind::Other,
+            "no step of the tool call is running, so its files are out of reach",
+        );
+        assert_eq!(call.stat("/a"), Err(outside.clone()));
+        assert_eq!(call.list("/"), Err(outside.clone()));
+        assert_eq!(call.read("/a"), Err(outside.clone()));
+        assert_eq!(call.read_range("/a", 0, 1), Err(outside));
     }
 
     #[test]

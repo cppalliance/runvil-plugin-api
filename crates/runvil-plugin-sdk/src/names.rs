@@ -14,6 +14,9 @@ pub(crate) const MAX_LINE: usize = 1024;
 /// The contract's bound on a tool result's text, in bytes.
 pub(crate) const MAX_RESULT: usize = 16_777_216;
 
+/// The contract's bound on a path a file function takes, in bytes.
+pub(crate) const MAX_PATH: usize = 4096;
+
 /// Whether `name` is one name segment the Harness accepts: 1 to 64 bytes
 /// of lowercase ASCII letters, digits, `-`, `_`, and `.`.
 pub(crate) const fn is_valid_name(name: &str) -> bool {

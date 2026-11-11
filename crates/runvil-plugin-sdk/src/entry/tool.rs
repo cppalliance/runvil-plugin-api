@@ -4,6 +4,7 @@
 
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr::{self, NonNull};
+use std::sync::atomic::Ordering;
 use std::task::{Context, Poll, Waker};
 
 use runvil_plugin_sys::{
@@ -24,14 +25,27 @@ struct Call {
     /// instance, and it is declared first, so it is dropped before `state`
     /// is freed.
     future: BoxFuture<'static, Result<ToolOutput, ToolError>>,
-    /// The tool name and the arguments the future's [`ToolCall`] reads.
-    _state: OwnedState,
+    /// The tool name and the arguments the future's [`ToolCall`] reads,
+    /// and the step its file methods go through.
+    state: OwnedState,
 }
 
 /// The owner of one call's [`CallState`]: frees it when dropped. A raw
 /// pointer, not a `Box`, so that moving the owner leaves the future's
 /// borrow of the state valid.
 struct OwnedState(NonNull<CallState>);
+
+impl OwnedState {
+    /// Names `step` as the step that is running, or no step when it is
+    /// `None`, for the file methods of the call's [`ToolCall`].
+    fn set_step(&self, step: Option<&RvToolCallArgs>) {
+        let step = step.map_or(ptr::null_mut(), |step| ptr::from_ref(step).cast_mut());
+        // SAFETY: the allocation lives until this owner drops.
+        unsafe { self.0.as_ref() }
+            .step
+            .store(step, Ordering::Release);
+    }
+}
 
 impl Drop for OwnedState {
     fn drop(&mut self) {
@@ -42,34 +56,44 @@ impl Drop for OwnedState {
 }
 
 impl Call {
-    /// Starts a call of `tool` on `pack` with `arguments`, by making the
-    /// future of [`Pack::call`].
+    /// Starts a call of `tool` on `pack` with `arguments`, in the step
+    /// `step`, by making the future of [`Pack::call`].
     ///
     /// # Errors
     /// Returns the call's failure when `Pack::call` panics.
-    fn start(pack: &'static dyn Pack, tool: &str, arguments: &str) -> Result<Box<Call>, ToolError> {
-        let state = OwnedState(NonNull::from(Box::leak(Box::new(CallState {
-            tool: tool.to_owned(),
-            arguments: arguments.to_owned(),
-        }))));
+    fn start(
+        pack: &'static dyn Pack,
+        tool: &str,
+        arguments: &str,
+        step: &RvToolCallArgs,
+    ) -> Result<Box<Call>, ToolError> {
+        let state = OwnedState(NonNull::from(Box::leak(Box::new(CallState::new(
+            tool, arguments,
+        )))));
+        // `Pack::call` runs inside the step, so it may read files.
+        state.set_step(Some(step));
         // SAFETY: the allocation lives until `state` drops, which is after
         // the future that borrows it: on the panic path below no future
         // exists, and in a `Call` the future is the field dropped first.
         let lent: &'static CallState = unsafe { state.0.as_ref() };
         let future = panic::catch_unwind(AssertUnwindSafe(|| pack.call(ToolCall::new(lent))))
             .map_err(|payload| panicked(&*payload))?;
-        Ok(Box::new(Call {
-            future,
-            _state: state,
-        }))
+        state.set_step(None);
+        Ok(Box::new(Call { future, state }))
     }
 
-    /// Polls the future once. A panic in it ends the call as a failure.
-    fn poll(&mut self) -> Poll<Result<ToolOutput, ToolError>> {
+    /// Polls the future once, in the step `step`. A panic in it ends the
+    /// call as a failure.
+    fn poll(&mut self, step: &RvToolCallArgs) -> Poll<Result<ToolOutput, ToolError>> {
         // The Host sends the next step on its own, so nothing wakes.
         let mut cx = Context::from_waker(Waker::noop());
-        panic::catch_unwind(AssertUnwindSafe(|| self.future.as_mut().poll(&mut cx)))
-            .unwrap_or_else(|payload| Poll::Ready(Err(panicked(&*payload))))
+        self.state.set_step(Some(step));
+        let polled = panic::catch_unwind(AssertUnwindSafe(|| self.future.as_mut().poll(&mut cx)))
+            .unwrap_or_else(|payload| Poll::Ready(Err(panicked(&*payload))));
+        // The step's arguments are gone once it returns, so nothing may
+        // reach them after this.
+        self.state.set_step(None);
+        polled
     }
 }
 
@@ -118,7 +142,7 @@ pub(super) unsafe fn step(call: *mut RvCall) -> RvStatus {
             Err(status) => return status,
         },
     };
-    match open.poll() {
+    match open.poll(args) {
         Poll::Pending => {
             // SAFETY: as above.
             unsafe { (&raw mut (*call).tool_call).write(Box::into_raw(open).cast()) };
@@ -151,7 +175,7 @@ unsafe fn start(call: *mut RvCall, args: &RvToolCallArgs) -> Result<Box<Call>, R
         return Err(RV_ERR_MISUSE);
     };
     // SAFETY: `args` belongs to the open step.
-    Call::start(pack, tool, arguments).map_err(|error| unsafe { finish(args, &Err(error)) })
+    Call::start(pack, tool, arguments, args).map_err(|error| unsafe { finish(args, &Err(error)) })
 }
 
 /// Ends the call through the Host's `finish` with `result`, and returns

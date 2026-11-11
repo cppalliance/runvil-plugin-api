@@ -13,6 +13,14 @@
 //! let output = pack.call("fetch", r#"{"url":"https://example.com"}"#).unwrap();
 //! ```
 //!
+//! A tool that reads files gets them from a [`Files`] tree, which
+//! [`PackRun::with_files`] gives the run:
+//!
+//! ```text
+//! let files = Files::new().file("/notes/a.md", "one\ntwo\n");
+//! let pack = loaded.new_pack("acme/notes").unwrap().with_files(files);
+//! ```
+//!
 //! A Plugin crate enables it from `[dev-dependencies]` only:
 //!
 //! ```text
@@ -21,14 +29,17 @@
 //! ```
 
 mod call;
+mod file;
 #[cfg(test)]
 mod fixture;
 mod json;
 mod load;
 mod pack;
 mod session;
+mod tree;
 
 use std::ffi::c_void;
+use std::sync::Arc;
 use std::{mem, ptr};
 
 use runvil_plugin_sys::{
@@ -38,6 +49,7 @@ use runvil_plugin_sys::{
 };
 
 use self::session::{Described, Session, Verb};
+pub use self::tree::Files;
 use crate::entry::{rv_str, size_field};
 use crate::{Plugin, ToolError, ToolInfo, ToolOutput, entry};
 
@@ -167,6 +179,7 @@ impl Loaded {
             loaded: self,
             instance: call.pack_run,
             tools: mem::take(&mut session.tools),
+            files: Arc::default(),
         })
     }
 
@@ -217,6 +230,8 @@ pub struct PackRun<'a> {
     /// What `RV_PACK_NEW` left in `call->pack_run`.
     instance: *mut c_void,
     tools: Vec<ToolInfo>,
+    /// The run's files, which each step's file functions read.
+    files: Arc<Files>,
 }
 
 impl PackRun<'_> {
@@ -224,6 +239,15 @@ impl PackRun<'_> {
     #[must_use]
     pub fn tools(&self) -> &[ToolInfo] {
         &self.tools
+    }
+
+    /// The instance with `files` as the files of its run, in place of a
+    /// tree with nothing but its root. Every call made from here on reads
+    /// them.
+    #[must_use]
+    pub fn with_files(mut self, files: Files) -> Self {
+        self.files = Arc::new(files);
+        self
     }
 
     /// Runs one call of `tool` with `arguments`, the JSON text of its
@@ -324,7 +348,7 @@ impl Call<'_> {
             tool_call: self.state,
             ..self.pack.new_call(RV_TOOL_CALL)
         };
-        let (status, mut session) = session::open(Verb::ToolCall, |ctx| {
+        let (status, mut session) = session::open_step(Arc::clone(&self.pack.files), |ctx| {
             let args = RvToolCallArgs {
                 size: size_field::<RvToolCallArgs>(),
                 reserved: 0,
@@ -332,6 +356,9 @@ impl Call<'_> {
                 tool: rv_str(&self.tool),
                 arguments: rv_str(&self.arguments),
                 finish: call::finish,
+                file_stat: file::file_stat,
+                file_list: file::file_list,
+                file_read: file::file_read,
             };
             call.args = (&raw const args).cast();
             // SAFETY: `load_entry`'s caller guaranteed `entry` follows the

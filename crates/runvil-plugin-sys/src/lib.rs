@@ -23,7 +23,8 @@
 //! - Strings are a pointer plus a length, UTF-8, not NUL-terminated.
 //! - A struct or a string that one side passes to the other is valid only
 //!   until the function it was passed to returns. The receiver copies what
-//!   it keeps.
+//!   it keeps. What a file function hands back stays valid a little
+//!   longer, as the section on files says.
 //! - Verb names follow `RV_<OBJECT>_<ACTION>`. Libraries open and close;
 //!   Plugins load and unload.
 //!
@@ -77,6 +78,31 @@
 //!   for long, or blocks, stalls its run, and a run can be canceled only
 //!   between steps. [`RV_PENDING`] is not a way to wait: the Host sends the
 //!   next step as soon as the run's other work has had a turn.
+//!
+//! # Files
+//!
+//! - A step reads the files of its run through the three file functions
+//!   in its [`RvToolCallArgs`]: `file_stat`, `file_list`, and `file_read`.
+//!   They are how a tool reaches a run's files, so the run's policy applies
+//!   to every read. This version has no function that changes a file.
+//! - A path names a file of the run, with `/` between its segments. A path
+//!   that does not begin with `/` is taken from the run's root.
+//! - `file_stat`, and each entry `file_list` hands back, describe a link
+//!   and not what it leads to. `file_list` and `file_read` act on what a
+//!   link leads to.
+//! - The Plugin passes each file function a struct for its result and an
+//!   [`RvFileError`], both its own. The function returns [`RV_OK`] and
+//!   fills the result, or returns [`RV_ERR_FILE`] and fills the error. A
+//!   file function that fails does not fail the tool call: the tool
+//!   decides what its result says.
+//! - What a file function hands back through those structs belongs to the
+//!   Host: the bytes, the entries and the names in them, and an error's
+//!   text. Each stays valid until the next file function called through
+//!   the same `ctx`, or until the step returns, whichever comes first. The
+//!   Plugin copies what it keeps and frees none of it.
+//! - A file function returns when its operation is done. A tool that
+//!   reads many files returns [`RV_PENDING`] between them now and then, so
+//!   that no step works for long.
 //!
 //! # Threads and lifetime
 //!
@@ -143,6 +169,8 @@
 //! - [`RV_ERR_UNSUPPORTED`] (6) means the Plugin doesn't know the verb.
 //! - [`RV_PENDING`] (7) means a tool call needs another step. Only
 //!   [`RV_TOOL_CALL`] returns it.
+//! - [`RV_ERR_FILE`] (8) means a file function failed. Only a file
+//!   function returns it.
 //!
 //! # Versions
 //!
@@ -165,8 +193,8 @@
 //! - No dependencies and no `unsafe`: this crate only declares.
 //! - `include/runvil_plugin.h` is generated from this file and never
 //!   edited by hand; `cargo test -p build-xtask` fails when it is stale.
-//! - Status codes, verbs, and result kinds keep their numbers in every
-//!   version; the unit tests pin them.
+//! - Status codes, verbs, result kinds, file types, and file error kinds
+//!   keep their numbers in every version; the unit tests pin them.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -185,6 +213,9 @@ pub const RV_ERR_REFUSED: RvStatus = 5;
 pub const RV_ERR_UNSUPPORTED: RvStatus = 6;
 /// The tool call needs another step; only [`RV_TOOL_CALL`] returns it.
 pub const RV_PENDING: RvStatus = 7;
+/// A file function failed, and its `error` says how; only a file function
+/// returns it.
+pub const RV_ERR_FILE: RvStatus = 8;
 
 /// The operation an [`RvCall`] asks for. A fixed-width integer, not a C
 /// enum, so its size never depends on the compiler.
@@ -221,10 +252,44 @@ pub const RV_RESULT_TRANSPORT: RvResultKind = 4;
 /// The call failed for any other reason.
 pub const RV_RESULT_OTHER: RvResultKind = 5;
 
+/// What a path names, in an [`RvStat`]. A fixed-width integer, as
+/// [`RvVerb`] is.
+pub type RvFileType = u32;
+/// Something that is none of the kinds below, such as a pipe, a socket, or
+/// a device.
+pub const RV_FILE_TYPE_OTHER: RvFileType = 0;
+/// A regular file.
+pub const RV_FILE_TYPE_FILE: RvFileType = 1;
+/// A directory.
+pub const RV_FILE_TYPE_DIRECTORY: RvFileType = 2;
+/// A symbolic link.
+pub const RV_FILE_TYPE_SYMLINK: RvFileType = 3;
+
+/// Why a file function failed, in an [`RvFileError`]. A fixed-width
+/// integer, as [`RvVerb`] is.
+pub type RvFileErrorKind = u32;
+/// A reason the kinds below do not name.
+pub const RV_FILE_ERROR_OTHER: RvFileErrorKind = 0;
+/// Nothing is at the path.
+pub const RV_FILE_ERROR_NOT_FOUND: RvFileErrorKind = 1;
+/// The path names something that is not a directory, where the operation
+/// needs one.
+pub const RV_FILE_ERROR_NOT_A_DIRECTORY: RvFileErrorKind = 2;
+/// The path names a directory, where the operation needs a file.
+pub const RV_FILE_ERROR_IS_A_DIRECTORY: RvFileErrorKind = 3;
+/// The run's policy does not allow the operation. The error's text is the
+/// policy's own reason.
+pub const RV_FILE_ERROR_DENIED: RvFileErrorKind = 4;
+/// Another tool call of the run changed the path, or is changing it, at
+/// the same time. The same operation can succeed in a later call.
+pub const RV_FILE_ERROR_CONFLICT: RvFileErrorKind = 5;
+/// The operating system failed the operation.
+pub const RV_FILE_ERROR_IO: RvFileErrorKind = 6;
+
 /// The contract's major version, which [`RvHost`] reports.
 pub const RV_API_MAJOR: u32 = 0;
 /// The contract's minor version, which [`RvHost`] reports.
-pub const RV_API_MINOR: u32 = 3;
+pub const RV_API_MINOR: u32 = 4;
 
 /// A UTF-8 string that is not NUL-terminated.
 #[repr(C)]
@@ -234,6 +299,63 @@ pub struct RvStr {
     pub ptr: *const c_char,
     /// The length in bytes.
     pub len: usize,
+}
+
+/// A run of bytes, which `file_read` hands back.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RvBytes {
+    /// The first byte. It may be NULL when `len` is zero.
+    pub ptr: *const u8,
+    /// The length in bytes.
+    pub len: usize,
+}
+
+/// What a path names, which `file_stat` fills and each [`RvDirEntry`] holds.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RvStat {
+    /// One of the `RV_FILE_TYPE_` constants.
+    pub file_type: RvFileType,
+    /// Zero.
+    pub reserved: u32,
+    /// The length of a file in bytes. For anything but a file the number
+    /// means nothing.
+    pub len: u64,
+}
+
+/// One entry of a directory, in an [`RvDirEntries`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RvDirEntry {
+    /// The entry's name within its directory.
+    pub name: RvStr,
+    /// What the entry is.
+    pub stat: RvStat,
+}
+
+/// The entries of a directory, in no promised order, which `file_list`
+/// hands back.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RvDirEntries {
+    /// The first entry. It may be NULL when `len` is zero.
+    pub ptr: *const RvDirEntry,
+    /// How many entries there are.
+    pub len: usize,
+}
+
+/// Why a file function failed, which the function fills when it returns
+/// [`RV_ERR_FILE`].
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct RvFileError {
+    /// One of the `RV_FILE_ERROR_` constants.
+    pub kind: RvFileErrorKind,
+    /// Zero.
+    pub reserved: u32,
+    /// What went wrong, in words a model can read.
+    pub text: RvStr,
 }
 
 /// What a Plugin tells `describe_plugin` about itself.
@@ -366,9 +488,9 @@ pub struct RvPackNewArgs {
     pub add_tool: unsafe extern "C" fn(ctx: *mut c_void, info: *const RvToolInfo) -> RvStatus,
 }
 
-/// The arguments of [`RV_TOOL_CALL`]: the tool, its arguments, and the
-/// function that ends the call. Every step of one call gets the same
-/// `tool` and `arguments`.
+/// The arguments of [`RV_TOOL_CALL`]: the tool, its arguments, the
+/// function that ends the call, and the file functions. Every step of one
+/// call gets the same `tool` and `arguments`.
 #[repr(C)]
 #[derive(Debug)]
 pub struct RvToolCallArgs {
@@ -377,7 +499,7 @@ pub struct RvToolCallArgs {
     /// Zero.
     pub reserved: u32,
     /// The Host's context for this step, passed back as the first argument
-    /// of the function below. The Plugin never reads through it.
+    /// of each function below. The Plugin never reads through it.
     pub ctx: *mut c_void,
     /// The tool's name, as the instance gave it to `add_tool`.
     pub tool: RvStr,
@@ -386,6 +508,32 @@ pub struct RvToolCallArgs {
     /// Ends the call with its result, exactly once, in the step that then
     /// returns [`RV_OK`].
     pub finish: unsafe extern "C" fn(ctx: *mut c_void, result: *const RvToolResult) -> RvStatus,
+    /// Says what `path`, at most 4096 bytes, names. Fills `stat`.
+    pub file_stat: unsafe extern "C" fn(
+        ctx: *mut c_void,
+        path: RvStr,
+        stat: *mut RvStat,
+        error: *mut RvFileError,
+    ) -> RvStatus,
+    /// Lists the directory at `path`, at most 4096 bytes. Fills `entries`.
+    pub file_list: unsafe extern "C" fn(
+        ctx: *mut c_void,
+        path: RvStr,
+        entries: *mut RvDirEntries,
+        error: *mut RvFileError,
+    ) -> RvStatus,
+    /// Reads up to `len` bytes of the file at `path`, at most 4096 bytes,
+    /// from the byte `offset` on. Fills `bytes`, with fewer than `len`
+    /// bytes when the file ends first, and none when `offset` is at or
+    /// past its end.
+    pub file_read: unsafe extern "C" fn(
+        ctx: *mut c_void,
+        path: RvStr,
+        offset: u64,
+        len: u64,
+        bytes: *mut RvBytes,
+        error: *mut RvFileError,
+    ) -> RvStatus,
 }
 
 /// One call into a Plugin's entry point.
@@ -431,15 +579,18 @@ mod tests {
     use core::mem::{offset_of, size_of};
 
     use super::{
-        RV_API_MAJOR, RV_API_MINOR, RV_ERR_MISUSE, RV_ERR_REFUSED, RV_ERR_UNSUPPORTED, RV_OK,
-        RV_PACK_DELETE, RV_PACK_NEW, RV_PENDING, RV_PLUGIN_LOAD, RV_PLUGIN_UNLOAD,
-        RV_RESULT_BACKEND, RV_RESULT_INVALID_ARGUMENTS, RV_RESULT_OTHER, RV_RESULT_TRANSPORT,
-        RV_RESULT_TRUSTED, RV_RESULT_UNTRUSTED, RV_TOOL_CALL, RV_TOOL_CANCEL,
+        RV_API_MAJOR, RV_API_MINOR, RV_ERR_FILE, RV_ERR_MISUSE, RV_ERR_REFUSED, RV_ERR_UNSUPPORTED,
+        RV_FILE_ERROR_CONFLICT, RV_FILE_ERROR_DENIED, RV_FILE_ERROR_IO,
+        RV_FILE_ERROR_IS_A_DIRECTORY, RV_FILE_ERROR_NOT_A_DIRECTORY, RV_FILE_ERROR_NOT_FOUND,
+        RV_FILE_ERROR_OTHER, RV_FILE_TYPE_DIRECTORY, RV_FILE_TYPE_FILE, RV_FILE_TYPE_OTHER,
+        RV_FILE_TYPE_SYMLINK, RV_OK, RV_PACK_DELETE, RV_PACK_NEW, RV_PENDING, RV_PLUGIN_LOAD,
+        RV_PLUGIN_UNLOAD, RV_RESULT_BACKEND, RV_RESULT_INVALID_ARGUMENTS, RV_RESULT_OTHER,
+        RV_RESULT_TRANSPORT, RV_RESULT_TRUSTED, RV_RESULT_UNTRUSTED, RV_TOOL_CALL, RV_TOOL_CANCEL,
     };
     #[cfg(target_pointer_width = "64")]
     use super::{
-        RvCall, RvHost, RvLoadArgs, RvPackInfo, RvPackNewArgs, RvPluginInfo, RvStr, RvToolCallArgs,
-        RvToolInfo, RvToolResult,
+        RvBytes, RvCall, RvDirEntries, RvDirEntry, RvFileError, RvHost, RvLoadArgs, RvPackInfo,
+        RvPackNewArgs, RvPluginInfo, RvStat, RvStr, RvToolCallArgs, RvToolInfo, RvToolResult,
     };
 
     #[test]
@@ -493,6 +644,32 @@ mod tests {
 
     #[test]
     #[cfg(target_pointer_width = "64")]
+    fn what_a_file_function_hands_back_keeps_its_layout() {
+        assert_eq!(size_of::<RvBytes>(), 16);
+        assert_eq!(offset_of!(RvBytes, ptr), 0);
+        assert_eq!(offset_of!(RvBytes, len), 8);
+
+        assert_eq!(size_of::<RvStat>(), 16);
+        assert_eq!(offset_of!(RvStat, file_type), 0);
+        assert_eq!(offset_of!(RvStat, reserved), 4);
+        assert_eq!(offset_of!(RvStat, len), 8);
+
+        assert_eq!(size_of::<RvDirEntry>(), 32);
+        assert_eq!(offset_of!(RvDirEntry, name), 0);
+        assert_eq!(offset_of!(RvDirEntry, stat), 16);
+
+        assert_eq!(size_of::<RvDirEntries>(), 16);
+        assert_eq!(offset_of!(RvDirEntries, ptr), 0);
+        assert_eq!(offset_of!(RvDirEntries, len), 8);
+
+        assert_eq!(size_of::<RvFileError>(), 24);
+        assert_eq!(offset_of!(RvFileError, kind), 0);
+        assert_eq!(offset_of!(RvFileError, reserved), 4);
+        assert_eq!(offset_of!(RvFileError, text), 8);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
     fn the_host_keeps_its_layout() {
         assert_eq!(size_of::<RvHost>(), 16);
         assert_eq!(offset_of!(RvHost, size), 0);
@@ -528,13 +705,16 @@ mod tests {
     #[test]
     #[cfg(target_pointer_width = "64")]
     fn the_tool_call_arguments_keep_their_layout() {
-        assert_eq!(size_of::<RvToolCallArgs>(), 56);
+        assert_eq!(size_of::<RvToolCallArgs>(), 80);
         assert_eq!(offset_of!(RvToolCallArgs, size), 0);
         assert_eq!(offset_of!(RvToolCallArgs, reserved), 4);
         assert_eq!(offset_of!(RvToolCallArgs, ctx), 8);
         assert_eq!(offset_of!(RvToolCallArgs, tool), 16);
         assert_eq!(offset_of!(RvToolCallArgs, arguments), 32);
         assert_eq!(offset_of!(RvToolCallArgs, finish), 48);
+        assert_eq!(offset_of!(RvToolCallArgs, file_stat), 56);
+        assert_eq!(offset_of!(RvToolCallArgs, file_list), 64);
+        assert_eq!(offset_of!(RvToolCallArgs, file_read), 72);
     }
 
     #[test]
@@ -557,6 +737,22 @@ mod tests {
         assert_eq!(RV_ERR_REFUSED, 5);
         assert_eq!(RV_ERR_UNSUPPORTED, 6);
         assert_eq!(RV_PENDING, 7);
+        assert_eq!(RV_ERR_FILE, 8);
+    }
+
+    #[test]
+    fn the_file_types_and_the_file_error_kinds_keep_their_numbers() {
+        assert_eq!(RV_FILE_TYPE_OTHER, 0);
+        assert_eq!(RV_FILE_TYPE_FILE, 1);
+        assert_eq!(RV_FILE_TYPE_DIRECTORY, 2);
+        assert_eq!(RV_FILE_TYPE_SYMLINK, 3);
+        assert_eq!(RV_FILE_ERROR_OTHER, 0);
+        assert_eq!(RV_FILE_ERROR_NOT_FOUND, 1);
+        assert_eq!(RV_FILE_ERROR_NOT_A_DIRECTORY, 2);
+        assert_eq!(RV_FILE_ERROR_IS_A_DIRECTORY, 3);
+        assert_eq!(RV_FILE_ERROR_DENIED, 4);
+        assert_eq!(RV_FILE_ERROR_CONFLICT, 5);
+        assert_eq!(RV_FILE_ERROR_IO, 6);
     }
 
     #[test]

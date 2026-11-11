@@ -1,6 +1,6 @@
 [package]
 name = "runvil-plugin-sdk"
-version = "0.3.0"
+version = "0.4.0"
 description = "Write a runvil Plugin in safe Rust, over runvil-plugin-sys"
 edition.workspace = true
 # The floor a Plugin author's toolchain needs; CI's msrv job builds it.
