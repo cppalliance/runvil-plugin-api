@@ -88,7 +88,7 @@ export_plugin!(Acme);
 `cargo build --release` writes `acme_plugin.dll` (Windows), `libacme_plugin.so` (Linux), or `libacme_plugin.dylib` (macOS) to `target/release`. That one file goes in the Host's Plugin directory. `examples/hello-plugin` is a complete Plugin with tests.
 
 - The Plugin's name and version, and the name and description of each Pack, are checked when the Plugin is compiled: one the Harness would reject fails the build, with a message naming the rule.
-- The Pack's name is a vendor and a Pack id joined by `/`. A prompt reaches the tool above as `hello/greet`, the Pack id and the tool's name.
+- The Pack's name is a vendor and a Pack id joined by `/`. A prompt reaches the tool above as `hello/greet`, the Pack id and the tool's name. A model calls it by its wire name, which is `hello_greet` unless `ToolInfo::wire_name` sets another.
 - Arguments and parameter schemas cross as JSON text, so the SDK needs no JSON library. A Plugin parses `call.arguments()` with one of its own.
 - A tool call is a future the Host polls once per step, and the Host sends the next step without being woken. A call that does a long job awaits `next_step()` every so often, so that no step works for long and the Host can abandon the call between two steps.
 - A tool reads the files of its run through its `ToolCall`: `stat`, `list`, `read`, and `read_range`. Each goes through the Host, so the run's policy applies to every read. A read that fails returns a `FileError` with a kind and the Host's words for what went wrong, and the call goes on, so the tool decides what the model reads. The methods work on the thread that runs the step and on no other. This version has no method that changes a file.
@@ -119,7 +119,7 @@ let pack = loaded.new_pack("acme/notes").unwrap().with_files(files);
 
 ### Linked and library builds of one Plugin
 
-A Host can also link a Plugin crate in and hand `runvil_plugin_sdk::entry::<Acme>` to the Harness, so no symbol is exported. Two linked Plugins that both export `runvil_plugin` cannot share one binary, so a crate built both ways puts `export_plugin!` behind a feature of its own, as `examples/hello-plugin` does with `dll`.
+A Host can also link a Plugin crate in and pass `runvil_plugin_sdk::entry::<Acme>` to the Harness's `insert_plugin`, so no symbol is exported. Two linked Plugins that both export `runvil_plugin` cannot share one binary, so a crate built both ways puts `export_plugin!` behind a feature of its own, as `examples/hello-plugin` does with `dll`.
 
 ## Writing a Plugin in C or C++
 

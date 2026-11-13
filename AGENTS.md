@@ -44,4 +44,4 @@ Anything else gets a qualified lowercase name, such as Rust's built-in test harn
 - Linter: `cargo clippy --workspace --all-targets --all-features`, gated with `CARGO_BUILD_WARNINGS=deny`.
 - Formatter: `cargo fmt --all --check`.
 - Docs: `cargo doc --workspace --no-deps --all-features` with `RUSTDOCFLAGS="-D warnings"`.
-- Toolchain floor of the two published crates: `cargo +1.85 check -p runvil-plugin-sys -p runvil-plugin-sdk --all-features`.
+- Toolchain floor of the two crates a Plugin depends on: `cargo +1.85 check -p runvil-plugin-sys -p runvil-plugin-sdk --all-features`.
