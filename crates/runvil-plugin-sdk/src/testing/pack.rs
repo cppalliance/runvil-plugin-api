@@ -86,6 +86,7 @@ mod tests {
             [
                 ToolInfo::new("tool", "A fixture tool.", "{}").wire_name("Tool"),
                 ToolInfo::new("other", "Another fixture tool.", "{}"),
+                ToolInfo::new("asks", "A fixture tool that reads a file.", "{}"),
             ]
         );
         assert_eq!(DELETES.get(), 0);

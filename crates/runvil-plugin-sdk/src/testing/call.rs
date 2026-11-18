@@ -9,6 +9,7 @@ use runvil_plugin_sys::{
     RvToolResult,
 };
 
+use super::file::FINISH_AFTER_REQUEST;
 use super::session::{Field, Session, Shape, TOOL_CALL, answer, field, shape};
 use super::{Failure, ToolResult};
 use crate::{ToolError, ToolErrorKind, ToolOutput};
@@ -22,6 +23,9 @@ pub(super) unsafe extern "C" fn finish(ctx: *mut c_void, result: *const RvToolRe
     answer(ctx, &TOOL_CALL, |session| {
         if session.result.is_some() {
             return Err("finish was called twice");
+        }
+        if session.request.is_some() {
+            return Err(FINISH_AFTER_REQUEST);
         }
         // SAFETY: the contract makes `result` point at a readable
         // `RvToolResult` during this call.
@@ -74,8 +78,8 @@ mod tests {
 
     use runvil_plugin_sys::RV_ERR_UNSUPPORTED;
 
-    use crate::testing::Failure;
-    use crate::testing::fixture::{self, Breach, CANCELS};
+    use crate::testing::fixture::{self, ANSWERS, Breach, CANCELS};
+    use crate::testing::{Failure, Files};
     use crate::{ToolError, ToolErrorKind, ToolOutput};
 
     #[test]
@@ -127,6 +131,40 @@ mod tests {
     }
 
     #[test]
+    fn a_file_request_is_answered_in_the_step_after_it() {
+        let loaded = fixture::load(Breach::None).unwrap();
+        let files = Files::new().file("/notes/a.md", "hello");
+        let pack = loaded.new_pack("acme/fixture").unwrap().with_files(files);
+        let mut call = pack.start("asks", "/notes/a.md");
+        assert_eq!(call.step(), Ok(None));
+        assert_eq!(ANSWERS.get(), 0, "the first step follows no request");
+        assert_eq!(call.step(), Ok(Some(Ok(ToolOutput::untrusted("hello")))));
+        assert_eq!(ANSWERS.get(), 1);
+        assert_eq!(CANCELS.get(), 0);
+    }
+
+    #[test]
+    fn a_failed_operation_is_answered_with_its_error_and_the_call_goes_on() {
+        let loaded = fixture::load(Breach::None).unwrap();
+        let pack = loaded.new_pack("acme/fixture").unwrap();
+        assert_eq!(
+            pack.call("asks", "/absent"),
+            Ok(Ok(ToolOutput::untrusted("1: not found: /absent")))
+        );
+    }
+
+    #[test]
+    fn a_step_that_follows_no_request_is_lent_no_answer() {
+        let loaded = fixture::load(Breach::None).unwrap();
+        let pack = loaded.new_pack("acme/fixture").unwrap();
+        assert_eq!(
+            pack.call("other", "{}"),
+            Ok(Ok(ToolOutput::untrusted("other after 2 steps")))
+        );
+        assert_eq!(ANSWERS.get(), 0);
+    }
+
+    #[test]
     fn an_abandoned_pending_call_is_canceled_once_and_an_unsent_one_never() {
         let loaded = fixture::load(Breach::None).unwrap();
         let pack = loaded.new_pack("acme/fixture").unwrap();
@@ -172,8 +210,18 @@ mod tests {
                 1,
             ),
             (
-                Breach::FileStatNull,
-                Failure::Misused("file_stat was handed a NULL stat pointer"),
+                Breach::RequestTwice,
+                Failure::Misused("a step made a second file request"),
+                1,
+            ),
+            (
+                Breach::RequestThenFinish,
+                Failure::Misused("a step called finish after it made a file request"),
+                0,
+            ),
+            (
+                Breach::FinishThenRequest,
+                Failure::Misused("a step made a file request after it called finish"),
                 0,
             ),
         ] {

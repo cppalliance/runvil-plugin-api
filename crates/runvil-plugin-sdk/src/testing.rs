@@ -21,6 +21,9 @@
 //! let pack = loaded.new_pack("acme/notes").unwrap().with_files(files);
 //! ```
 //!
+//! The fake Host performs a file request on that tree when the step that
+//! made it has returned, and lends the call's next step the answer.
+//!
 //! A Plugin crate enables it from `[dev-dependencies]` only:
 //!
 //! ```text
@@ -39,7 +42,6 @@ mod session;
 mod tree;
 
 use std::ffi::c_void;
-use std::sync::Arc;
 use std::{mem, ptr};
 
 use runvil_plugin_sys::{
@@ -179,7 +181,7 @@ impl Loaded {
             loaded: self,
             instance: call.pack_run,
             tools: mem::take(&mut session.tools),
-            files: Arc::default(),
+            files: Files::new(),
         })
     }
 
@@ -230,8 +232,9 @@ pub struct PackRun<'a> {
     /// What `RV_PACK_NEW` left in `call->pack_run`.
     instance: *mut c_void,
     tools: Vec<ToolInfo>,
-    /// The run's files, which each step's file functions read.
-    files: Arc<Files>,
+    /// The run's files, which the file requests of each call are
+    /// performed on.
+    files: Files,
 }
 
 impl PackRun<'_> {
@@ -246,7 +249,7 @@ impl PackRun<'_> {
     /// them.
     #[must_use]
     pub fn with_files(mut self, files: Files) -> Self {
-        self.files = Arc::new(files);
+        self.files = files;
         self
     }
 
@@ -290,6 +293,7 @@ impl PackRun<'_> {
             state: ptr::null_mut(),
             pending: false,
             ended: false,
+            answer: None,
         }
     }
 
@@ -326,6 +330,9 @@ pub struct Call<'a> {
     /// Whether the last step returned `RV_PENDING`.
     pending: bool,
     ended: bool,
+    /// The answer to the file request the last step made, which the next
+    /// step is lent.
+    answer: Option<file::Answer>,
 }
 
 impl Call<'_> {
@@ -333,12 +340,15 @@ impl Call<'_> {
     /// `RV_PENDING`, so the call needs another step, and the tool's own
     /// result once the call ended.
     ///
+    /// A file request the step made is performed on the run's [`Files`]
+    /// before this returns, and the call's next step is lent the answer.
+    ///
     /// # Errors
     /// Returns the [`Failure`] the Harness would report, checked in the
     /// Harness's order: a misuse, then a step that finished and still
     /// returned `RV_PENDING`, then a status other than `RV_OK`, then a
     /// step that returned `RV_OK` without finishing. A failure ends the
-    /// call.
+    /// call, and the file request of a step that failed is not performed.
     ///
     /// # Panics
     /// Panics when the call has ended, which the Harness never steps.
@@ -348,7 +358,11 @@ impl Call<'_> {
             tool_call: self.state,
             ..self.pack.new_call(RV_TOOL_CALL)
         };
-        let (status, mut session) = session::open_step(Arc::clone(&self.pack.files), |ctx| {
+        // The answer and what it points to stay valid until this
+        // function returns, which is after the step has.
+        let answer = self.answer.take();
+        let lent = answer.as_ref().map(file::Answer::raw);
+        let (status, mut session) = session::open(Verb::ToolCall, |ctx| {
             let args = RvToolCallArgs {
                 size: size_field::<RvToolCallArgs>(),
                 reserved: 0,
@@ -359,17 +373,21 @@ impl Call<'_> {
                 file_stat: file::file_stat,
                 file_list: file::file_list,
                 file_read: file::file_read,
+                answer: lent.as_ref().map_or(ptr::null(), ptr::from_ref),
             };
             call.args = (&raw const args).cast();
             // SAFETY: `load_entry`'s caller guaranteed `entry` follows the
-            // contract, and `call` and `args` are live structs that
-            // nothing else uses.
+            // contract, and `call`, `args`, and the answer `args` names
+            // are live structs that nothing else uses.
             unsafe { (self.pack.loaded.entry)(&raw mut call) }
         });
         self.state = call.tool_call;
         self.pending = status == RV_PENDING;
+        let request = session.request.take();
         let outcome = call::judge(status, &mut session);
-        if !matches!(outcome, Ok(None)) {
+        if matches!(outcome, Ok(None)) {
+            self.answer = request.map(|request| file::Answer::to(&request, &self.pack.files));
+        } else {
             self.end();
         }
         outcome

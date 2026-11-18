@@ -1,10 +1,10 @@
 //! The C entry point every [`Plugin`] gets: [`entry`], which answers each
 //! verb of the contract for the Plugin type it is instantiated with. The
 //! code of each verb sits in the child module of the object it acts on:
-//! `plugin`, `pack`, or `tool`. The child module `file` calls the Host's
-//! file functions for a tool call.
+//! `plugin`, `pack`, or `tool`. The child module `file` hands a tool
+//! call's file requests to the Host and copies the Host's answers.
 
-pub(crate) mod file;
+mod file;
 mod pack;
 mod plugin;
 mod tool;
@@ -43,8 +43,10 @@ use crate::{Plugin, Refusal};
 ///   [`tools`](crate::Pack::tools);
 /// - `RV_PACK_DELETE` by dropping that instance;
 /// - `RV_TOOL_CALL` by polling the future of
-///   [`Pack::call`](crate::Pack::call) once, and ending the call with its
-///   result when the future is ready;
+///   [`Pack::call`](crate::Pack::call) once, with the answer to its file
+///   request at hand, and then ending the call with its result when the
+///   future is ready, or else handing the Host the call's next file
+///   request;
 /// - `RV_TOOL_CANCEL` by dropping that future;
 /// - any other verb with `RV_ERR_UNSUPPORTED`.
 ///

@@ -55,8 +55,10 @@
 //! A tool reads the files of its run through its [`ToolCall`]:
 //! [`stat`](ToolCall::stat), [`list`](ToolCall::list),
 //! [`read`](ToolCall::read), and [`read_range`](ToolCall::read_range).
-//! Each goes through the Host, so the run's policy applies, and each
-//! fails with a [`FileError`] that leaves the call running.
+//! Each returns a [`FileFuture`]. Awaiting it hands the request to the
+//! Host and ends the step, and a later step goes on with the answer. The
+//! run's policy applies to every request, and one that fails resolves to
+//! a [`FileError`] that leaves the call running.
 //!
 //! The `test-support` feature adds `testing`, a fake Host for a Plugin
 //! crate's own tests.
@@ -69,9 +71,9 @@
 //! - The crate's `unsafe` sits in [`entry`] and its child modules, the
 //!   code [`export_plugin!`] expands to, and `testing`. A Plugin written
 //!   against it needs none.
-//! - What the Host lends through a file function is copied before the
-//!   [`ToolCall`] method returns, so nothing a Plugin holds points into
-//!   the Host's memory.
+//! - What the Host lends in the answer to a file request is copied before
+//!   the step polls the call's future, so nothing a Plugin holds points
+//!   into the Host's memory.
 //! - A panic in [`Plugin::load`] or [`Plugin::new_pack`] becomes a
 //!   refusal, a panic in a tool call ends that call as a failure, and a
 //!   panic while something the Plugin owns drops stays inside the Plugin;
@@ -95,7 +97,7 @@ pub mod testing;
 mod tool;
 
 pub use entry::entry;
-pub use file::{DirEntry, FileError, FileErrorKind, FileType, Stat};
+pub use file::{DirEntry, FileError, FileErrorKind, FileFuture, FileType, Stat};
 pub use pack::{BoxFuture, Pack, PackInfo};
 pub use runvil_plugin_sys as sys;
 pub use tool::{NextStep, ToolCall, ToolError, ToolErrorKind, ToolInfo, ToolOutput, next_step};

@@ -1,32 +1,89 @@
-//! The file functions a fake Host's `RvToolCallArgs` carries:
-//! `file_stat`, `file_list`, and `file_read`, each checking what the
-//! Plugin hands it as the Harness does, and [`Lent`], what the last of
-//! them handed back.
+//! The file functions a fake Host's `RvToolCallArgs` carries: `file_stat`,
+//! `file_list`, and `file_read`, each checking what the Plugin hands it
+//! as the Harness does and taking one request, and [`Answer`], what the
+//! fake Host lends the step after a request.
 
 use std::ffi::c_void;
+use std::ptr;
 
 use runvil_plugin_sys::{
-    RV_ERR_FILE, RV_MAX_PATH, RV_OK, RvBytes, RvDirEntries, RvDirEntry, RvFileError, RvStat,
-    RvStatus, RvStr,
+    RV_ERR_FILE, RV_MAX_PATH, RV_OK, RvBytes, RvDirEntries, RvDirEntry, RvFileAnswer, RvFileError,
+    RvStat, RvStatus, RvStr,
 };
 
-use super::session::{Field, Out, TOOL_CALL, answer, field, out};
-use crate::entry::rv_str;
+use super::Files;
+use super::session::{Field, TOOL_CALL, answer, field};
+use crate::entry::{rv_str, size_field};
+use crate::file::Request;
 use crate::{DirEntry, FileError, Stat};
 
 const PATH: Field = field!("the path", 4096, RV_MAX_PATH);
-const STAT: Out = out!("file_stat", "stat");
-const STAT_ERROR: Out = out!("file_stat", "error");
-const ENTRIES: Out = out!("file_list", "entries");
-const LIST_ERROR: Out = out!("file_list", "error");
-const BYTES: Out = out!("file_read", "bytes");
-const READ_ERROR: Out = out!("file_read", "error");
 
-/// What a step's last file function handed the Plugin. The contract
-/// keeps it valid until the step's next file function, so each one
-/// replaces it, and the step's end frees it.
-#[derive(Debug, Default)]
-pub(super) struct Lent {
+/// What a second file request in one step is called.
+const SECOND_REQUEST: &str = "a step made a second file request";
+/// What a file request in a step that called `finish` is called.
+const REQUEST_AFTER_FINISH: &str = "a step made a file request after it called finish";
+/// What `finish` in a step that made a file request is called.
+pub(super) const FINISH_AFTER_REQUEST: &str = "a step called finish after it made a file request";
+
+/// Takes the request `read` reads out of a file function's arguments, as
+/// the one request of the open step; returns `RV_OK`, or `RV_ERR_MISUSE`
+/// for a request the step may not make and for arguments `read` refuses.
+/// The step's own state is checked first, so `read` runs only for a
+/// request the step may make.
+fn take(ctx: *mut c_void, read: impl FnOnce() -> Result<Request, &'static str>) -> RvStatus {
+    answer(ctx, &TOOL_CALL, |session| {
+        if session.result.is_some() {
+            return Err(REQUEST_AFTER_FINISH);
+        }
+        if session.request.is_some() {
+            return Err(SECOND_REQUEST);
+        }
+        session.request = Some(read()?);
+        Ok(RV_OK)
+    })
+}
+
+/// Takes a request for what `path` names; returns `RV_OK` or
+/// `RV_ERR_MISUSE`, and fills nothing.
+pub(super) unsafe extern "C" fn file_stat(ctx: *mut c_void, path: RvStr) -> RvStatus {
+    // SAFETY: the contract makes `path` valid for its length during this
+    // call.
+    take(ctx, || Ok(Request::Stat(unsafe { PATH.read(path) }?)))
+}
+
+/// Takes a request for the entries of the directory at `path`; returns
+/// `RV_OK` or `RV_ERR_MISUSE`, and fills nothing.
+pub(super) unsafe extern "C" fn file_list(ctx: *mut c_void, path: RvStr) -> RvStatus {
+    // SAFETY: the contract makes `path` valid for its length during this
+    // call.
+    take(ctx, || Ok(Request::List(unsafe { PATH.read(path) }?)))
+}
+
+/// Takes a request for up to `len` bytes of the file at `path` from the
+/// byte `offset` on; returns `RV_OK` or `RV_ERR_MISUSE`, and fills
+/// nothing.
+pub(super) unsafe extern "C" fn file_read(
+    ctx: *mut c_void,
+    path: RvStr,
+    offset: u64,
+    len: u64,
+) -> RvStatus {
+    take(ctx, || {
+        // SAFETY: the contract makes `path` valid for its length during
+        // this call.
+        let path = unsafe { PATH.read(path) }?;
+        Ok(Request::Read { path, offset, len })
+    })
+}
+
+/// The answer to one request, with the memory it points into. The fake
+/// Host makes it when the step that asked has returned, and keeps it
+/// until the step that receives it has returned.
+#[derive(Debug)]
+pub(super) struct Answer {
+    /// What a path names, or zero when the request asked for no stat.
+    stat: RvStat,
     /// The bytes of a read.
     bytes: Vec<u8>,
     /// The names the entries of a listing point at, kept only so that
@@ -34,29 +91,53 @@ pub(super) struct Lent {
     _names: Vec<String>,
     /// The entries of a listing.
     entries: Vec<RvDirEntry>,
-    /// The text of a failure.
-    text: String,
+    /// Why the operation failed, when it did.
+    error: Option<FileError>,
 }
 
-impl Lent {
-    /// Keeps `bytes` and returns them as the contract hands them back.
-    fn bytes(&mut self, bytes: Vec<u8>) -> RvBytes {
-        *self = Lent {
-            bytes,
-            ..Lent::default()
+impl Answer {
+    /// Performs `request` on `files` and keeps what the operation
+    /// answers: the one thing the request asked for, or its failure.
+    pub(super) fn to(request: &Request, files: &Files) -> Answer {
+        let found = match request {
+            Request::Stat(path) => files.stat(path).map(Answer::of_stat),
+            Request::List(path) => files.list(path).map(Answer::of_entries),
+            Request::Read { path, offset, len } => {
+                files.read(path, *offset, *len).map(Answer::of_bytes)
+            }
         };
-        RvBytes {
-            ptr: self.bytes.as_ptr(),
-            len: self.bytes.len(),
+        found.unwrap_or_else(Answer::failed)
+    }
+
+    /// An answer that holds nothing.
+    fn empty() -> Answer {
+        Answer {
+            stat: RvStat {
+                file_type: 0,
+                reserved: 0,
+                len: 0,
+            },
+            bytes: Vec::new(),
+            _names: Vec::new(),
+            entries: Vec::new(),
+            error: None,
         }
     }
 
-    /// Keeps `entries` and returns them as the contract hands them back.
-    fn entries(&mut self, entries: Vec<DirEntry>) -> RvDirEntries {
+    /// The answer that holds `stat`.
+    fn of_stat(stat: Stat) -> Answer {
+        Answer {
+            stat: raw_stat(stat),
+            ..Answer::empty()
+        }
+    }
+
+    /// The answer that holds `entries`.
+    fn of_entries(entries: Vec<DirEntry>) -> Answer {
         let stats: Vec<RvStat> = entries.iter().map(|entry| raw_stat(entry.stat)).collect();
         let names: Vec<String> = entries.into_iter().map(|entry| entry.name).collect();
         // Each name's bytes sit in its own allocation, so moving `names`
-        // into `self` leaves the pointers below valid.
+        // into the answer leaves the pointers below valid.
         let entries = names
             .iter()
             .zip(stats)
@@ -65,29 +146,79 @@ impl Lent {
                 stat,
             })
             .collect();
-        *self = Lent {
+        Answer {
             _names: names,
             entries,
-            ..Lent::default()
-        };
-        RvDirEntries {
-            ptr: self.entries.as_ptr(),
-            len: self.entries.len(),
+            ..Answer::empty()
         }
     }
 
-    /// Keeps the text of `error` and returns the failure as the contract
-    /// hands it back.
-    fn error(&mut self, error: &FileError) -> RvFileError {
-        *self = Lent {
-            text: error.text().to_owned(),
-            ..Lent::default()
-        };
-        RvFileError {
-            kind: error.kind().raw(),
-            reserved: 0,
-            text: rv_str(&self.text),
+    /// The answer that holds `bytes`.
+    fn of_bytes(bytes: Vec<u8>) -> Answer {
+        Answer {
+            bytes,
+            ..Answer::empty()
         }
+    }
+
+    /// The answer of an operation that failed with `error`.
+    fn failed(error: FileError) -> Answer {
+        Answer {
+            error: Some(error),
+            ..Answer::empty()
+        }
+    }
+
+    /// The answer as the contract lends it to a step: the one field the
+    /// request asked for, or `error`, and every other field zero. It
+    /// points into this value, which the caller keeps until the step has
+    /// returned.
+    pub(super) fn raw(&self) -> RvFileAnswer {
+        let (status, error) = match &self.error {
+            Some(error) => (
+                RV_ERR_FILE,
+                RvFileError {
+                    kind: error.kind().raw(),
+                    reserved: 0,
+                    text: rv_str(error.text()),
+                },
+            ),
+            None => (
+                RV_OK,
+                RvFileError {
+                    kind: 0,
+                    reserved: 0,
+                    text: RvStr {
+                        ptr: ptr::null(),
+                        len: 0,
+                    },
+                },
+            ),
+        };
+        RvFileAnswer {
+            size: size_field::<RvFileAnswer>(),
+            status,
+            stat: self.stat,
+            entries: RvDirEntries {
+                ptr: first(&self.entries),
+                len: self.entries.len(),
+            },
+            bytes: RvBytes {
+                ptr: first(&self.bytes),
+                len: self.bytes.len(),
+            },
+            error,
+        }
+    }
+}
+
+/// Where `values` begin, or NULL when there are none, so that a field
+/// with nothing in it is zero.
+fn first<T>(values: &[T]) -> *const T {
+    if values.is_empty() {
+        ptr::null()
+    } else {
+        values.as_ptr()
     }
 }
 
@@ -100,177 +231,50 @@ fn raw_stat(stat: Stat) -> RvStat {
     }
 }
 
-/// Says what `path` names; returns `RV_OK` with `stat` filled,
-/// `RV_ERR_FILE` with `error` filled, or `RV_ERR_MISUSE`.
-pub(super) unsafe extern "C" fn file_stat(
-    ctx: *mut c_void,
-    path: RvStr,
-    stat: *mut RvStat,
-    error: *mut RvFileError,
-) -> RvStatus {
-    answer(ctx, &TOOL_CALL, |session| {
-        let stat = STAT.check(stat)?;
-        let error = STAT_ERROR.check(error)?;
-        // SAFETY: the contract makes `path` valid for its length during
-        // this call.
-        let path = unsafe { PATH.read(path) }?;
-        Ok(match session.files.stat(&path) {
-            Ok(found) => {
-                session.lent = Lent::default();
-                // SAFETY: `stat` is not NULL and is aligned, and the
-                // contract makes it a struct the Plugin owns.
-                unsafe { stat.write(raw_stat(found)) };
-                RV_OK
-            }
-            // SAFETY: as above, for `error`.
-            Err(failure) => unsafe { fail(&mut session.lent, error, &failure) },
-        })
-    })
-}
-
-/// Lists the directory at `path`; returns `RV_OK` with `entries` filled,
-/// `RV_ERR_FILE` with `error` filled, or `RV_ERR_MISUSE`.
-pub(super) unsafe extern "C" fn file_list(
-    ctx: *mut c_void,
-    path: RvStr,
-    entries: *mut RvDirEntries,
-    error: *mut RvFileError,
-) -> RvStatus {
-    answer(ctx, &TOOL_CALL, |session| {
-        let entries = ENTRIES.check(entries)?;
-        let error = LIST_ERROR.check(error)?;
-        // SAFETY: the contract makes `path` valid for its length during
-        // this call.
-        let path = unsafe { PATH.read(path) }?;
-        Ok(match session.files.list(&path) {
-            Ok(listed) => {
-                let lent = session.lent.entries(listed);
-                // SAFETY: `entries` is not NULL and is aligned, and the
-                // contract makes it a struct the Plugin owns.
-                unsafe { entries.write(lent) };
-                RV_OK
-            }
-            // SAFETY: as above, for `error`.
-            Err(failure) => unsafe { fail(&mut session.lent, error, &failure) },
-        })
-    })
-}
-
-/// Reads up to `len` bytes of the file at `path` from the byte `offset`
-/// on; returns `RV_OK` with `bytes` filled, `RV_ERR_FILE` with `error`
-/// filled, or `RV_ERR_MISUSE`.
-pub(super) unsafe extern "C" fn file_read(
-    ctx: *mut c_void,
-    path: RvStr,
-    offset: u64,
-    len: u64,
-    bytes: *mut RvBytes,
-    error: *mut RvFileError,
-) -> RvStatus {
-    answer(ctx, &TOOL_CALL, |session| {
-        let bytes = BYTES.check(bytes)?;
-        let error = READ_ERROR.check(error)?;
-        // SAFETY: the contract makes `path` valid for its length during
-        // this call.
-        let path = unsafe { PATH.read(path) }?;
-        Ok(match session.files.read(&path, offset, len) {
-            Ok(read) => {
-                let lent = session.lent.bytes(read);
-                // SAFETY: `bytes` is not NULL and is aligned, and the
-                // contract makes it a struct the Plugin owns.
-                unsafe { bytes.write(lent) };
-                RV_OK
-            }
-            // SAFETY: as above, for `error`.
-            Err(failure) => unsafe { fail(&mut session.lent, error, &failure) },
-        })
-    })
-}
-
-/// Hands `failure` back through `error`, with its text kept in `lent`,
-/// and returns `RV_ERR_FILE`.
-///
-/// # Safety
-/// `error` must be valid for a write of an `RvFileError`.
-unsafe fn fail(lent: &mut Lent, error: *mut RvFileError, failure: &FileError) -> RvStatus {
-    let raw = lent.error(failure);
-    // SAFETY: the caller makes `error` valid for the write.
-    unsafe { error.write(raw) };
-    RV_ERR_FILE
-}
-
 #[cfg(test)]
 mod tests {
     //! The file functions' rules, by calling each one as a Plugin's step
-    //! would and as it must not.
+    //! would and as it must not, and what an answer lends a step.
 
     use std::ffi::c_void;
-    use std::sync::Arc;
     use std::{ptr, slice};
 
     use runvil_plugin_sys::{
         RV_ERR_FILE, RV_ERR_MISUSE, RV_FILE_ERROR_DENIED, RV_FILE_ERROR_NOT_FOUND,
-        RV_FILE_TYPE_DIRECTORY, RV_FILE_TYPE_FILE, RV_OK, RvBytes, RvDirEntries, RvFileError,
-        RvStat, RvStatus, RvStr,
+        RV_FILE_TYPE_DIRECTORY, RV_FILE_TYPE_FILE, RV_OK, RV_RESULT_TRUSTED, RvFileAnswer,
+        RvStatus, RvStr, RvToolResult,
     };
 
-    use super::{file_list, file_read, file_stat};
-    use crate::entry::rv_str;
+    use super::{Answer, file_list, file_read, file_stat};
+    use crate::entry::{rv_str, size_field};
+    use crate::file::Request;
     use crate::testing::Files;
+    use crate::testing::call::finish;
     use crate::testing::session::{self, Verb};
     use crate::{FileError, FileErrorKind};
 
-    fn files() -> Arc<Files> {
-        Arc::new(
-            Files::new()
-                .file("/notes/a.md", "hello")
-                .file("/notes/b.md", "")
-                .fails(
-                    "/secret",
-                    FileError::new(FileErrorKind::Denied, "the mode allows only /notes"),
-                ),
-        )
+    fn files() -> Files {
+        Files::new()
+            .file("/notes/a.md", "hello")
+            .file("/notes/b.md", "")
+            .fails(
+                "/secret",
+                FileError::new(FileErrorKind::Denied, "the mode allows only /notes"),
+            )
     }
 
-    /// Runs `step` as one `RV_TOOL_CALL` step over the test's tree, and
-    /// returns what it returned beside the misuse the fake Host recorded.
-    fn in_step<T>(step: impl FnOnce(*mut c_void) -> T) -> (T, Option<&'static str>) {
+    /// Runs `step` as one `RV_TOOL_CALL` step, and returns what it
+    /// returned beside the request the fake Host took and the misuse it
+    /// recorded.
+    fn in_step<T>(
+        step: impl FnOnce(*mut c_void) -> T,
+    ) -> (T, Option<Request>, Option<&'static str>) {
         let mut out = None;
-        let (_status, session) = session::open_step(files(), |ctx| {
+        let (_status, session) = session::open(Verb::ToolCall, |ctx| {
             out = Some(step(ctx));
             RV_OK
         });
-        (out.expect("the step ran"), session.misuse)
-    }
-
-    fn empty_stat() -> RvStat {
-        RvStat {
-            file_type: 9,
-            reserved: 9,
-            len: 9,
-        }
-    }
-
-    fn empty_error() -> RvFileError {
-        RvFileError {
-            kind: 9,
-            reserved: 9,
-            text: rv_str("untouched"),
-        }
-    }
-
-    fn empty_bytes() -> RvBytes {
-        RvBytes {
-            ptr: ptr::null(),
-            len: 9,
-        }
-    }
-
-    fn empty_entries() -> RvDirEntries {
-        RvDirEntries {
-            ptr: ptr::null(),
-            len: 9,
-        }
+        (out.expect("the step ran"), session.request, session.misuse)
     }
 
     /// The text `s` holds.
@@ -283,170 +287,97 @@ mod tests {
         String::from_utf8(bytes.to_vec()).expect("the Host hands back UTF-8")
     }
 
+    /// Whether `answer` holds no stat, no entries, and no bytes.
+    fn holds_nothing(answer: &RvFileAnswer) -> bool {
+        (answer.stat.file_type, answer.stat.reserved, answer.stat.len) == (0, 0, 0)
+            && answer.entries.ptr.is_null()
+            && answer.entries.len == 0
+            && answer.bytes.ptr.is_null()
+            && answer.bytes.len == 0
+    }
+
+    /// Whether `answer` holds no error.
+    fn holds_no_error(answer: &RvFileAnswer) -> bool {
+        (answer.error.kind, answer.error.reserved) == (0, 0)
+            && answer.error.text.ptr.is_null()
+            && answer.error.text.len == 0
+    }
+
     #[test]
-    fn file_stat_fills_the_stat_and_leaves_the_error_alone() {
-        let ((status, stat, error), misuse) = in_step(|ctx| {
-            let (mut stat, mut error) = (empty_stat(), empty_error());
-            // SAFETY: the open step's `ctx`, a live path, and two live
-            // structs.
-            let status =
-                unsafe { file_stat(ctx, rv_str("/notes/a.md"), &raw mut stat, &raw mut error) };
-            (status, stat, error)
-        });
-        assert_eq!((status, misuse), (RV_OK, None));
+    fn each_file_function_takes_its_request() {
+        // SAFETY: the open step's `ctx` and a live path.
+        let stat = in_step(|ctx| unsafe { file_stat(ctx, rv_str("/notes/a.md")) });
         assert_eq!(
-            (stat.file_type, stat.reserved, stat.len),
-            (RV_FILE_TYPE_FILE, 0, 5)
+            stat,
+            (RV_OK, Some(Request::Stat("/notes/a.md".to_owned())), None)
         );
-        assert_eq!(error.kind, 9, "a success writes no error");
+        // SAFETY: as above.
+        let list = in_step(|ctx| unsafe { file_list(ctx, rv_str("notes")) });
+        assert_eq!(list, (RV_OK, Some(Request::List("notes".to_owned())), None));
+        // SAFETY: as above.
+        let read = in_step(|ctx| unsafe { file_read(ctx, rv_str("/notes/a.md"), 1, 3) });
+        let request = Request::Read {
+            path: "/notes/a.md".to_owned(),
+            offset: 1,
+            len: 3,
+        };
+        assert_eq!(read, (RV_OK, Some(request), None));
     }
 
     #[test]
-    fn file_stat_reports_a_directory() {
-        let ((status, stat), misuse) = in_step(|ctx| {
-            let (mut stat, mut error) = (empty_stat(), empty_error());
-            // SAFETY: as in the first test.
-            let status = unsafe { file_stat(ctx, rv_str("notes"), &raw mut stat, &raw mut error) };
-            (status, stat)
+    fn a_second_request_in_one_step_is_a_recorded_misuse_and_the_first_stays() {
+        // SAFETY: the open step's `ctx` and live paths.
+        let (statuses, request, misuse) = in_step(|ctx| unsafe {
+            (
+                file_stat(ctx, rv_str("/a")),
+                file_read(ctx, rv_str("/b"), 0, 1),
+            )
         });
-        assert_eq!((status, misuse), (RV_OK, None));
-        assert_eq!(stat.file_type, RV_FILE_TYPE_DIRECTORY);
+        assert_eq!(statuses, (RV_OK, RV_ERR_MISUSE));
+        assert_eq!(request, Some(Request::Stat("/a".to_owned())));
+        assert_eq!(misuse, Some("a step made a second file request"));
     }
 
     #[test]
-    fn a_failed_file_function_fills_the_error_and_leaves_the_result_alone() {
-        let ((status, stat, kind, reserved, message), misuse) = in_step(|ctx| {
-            let (mut stat, mut error) = (empty_stat(), empty_error());
-            // SAFETY: as in the first test.
-            let status =
-                unsafe { file_stat(ctx, rv_str("/absent"), &raw mut stat, &raw mut error) };
-            // SAFETY: the error's text is valid until the next file
-            // function of this step.
-            let message = unsafe { text(error.text) };
-            (status, stat, error.kind, error.reserved, message)
+    fn a_request_and_finish_in_one_step_are_a_recorded_misuse_in_either_order() {
+        let result = RvToolResult {
+            size: size_field::<RvToolResult>(),
+            kind: RV_RESULT_TRUSTED,
+            text: rv_str("done"),
+        };
+        // SAFETY: the open step's `ctx`, a live path, and a live result.
+        let (statuses, request, misuse) = in_step(|ctx| unsafe {
+            (finish(ctx, &raw const result), file_stat(ctx, rv_str("/a")))
         });
-        assert_eq!((status, misuse), (RV_ERR_FILE, None));
+        assert_eq!(statuses, (RV_OK, RV_ERR_MISUSE));
+        assert_eq!(request, None);
         assert_eq!(
-            (kind, reserved, message.as_str()),
-            (RV_FILE_ERROR_NOT_FOUND, 0, "not found: /absent")
+            misuse,
+            Some("a step made a file request after it called finish")
         );
-        assert_eq!(stat.file_type, 9, "a failure writes no result");
-    }
 
-    #[test]
-    fn file_list_hands_back_each_entry_with_its_name() {
-        let ((status, listed), misuse) = in_step(|ctx| {
-            let (mut entries, mut error) = (empty_entries(), empty_error());
-            // SAFETY: as in the first test.
-            let status =
-                unsafe { file_list(ctx, rv_str("/notes"), &raw mut entries, &raw mut error) };
-            // SAFETY: the entries and their names are valid until the
-            // next file function of this step.
-            let listed: Vec<(String, u32, u64)> = unsafe {
-                slice::from_raw_parts(entries.ptr, entries.len)
-                    .iter()
-                    .map(|entry| (text(entry.name), entry.stat.file_type, entry.stat.len))
-                    .collect()
-            };
-            (status, listed)
+        // SAFETY: as above.
+        let (statuses, request, misuse) = in_step(|ctx| unsafe {
+            (file_stat(ctx, rv_str("/a")), finish(ctx, &raw const result))
         });
-        assert_eq!((status, misuse), (RV_OK, None));
+        assert_eq!(statuses, (RV_OK, RV_ERR_MISUSE));
+        assert_eq!(request, Some(Request::Stat("/a".to_owned())));
         assert_eq!(
-            listed,
-            [
-                ("a.md".to_owned(), RV_FILE_TYPE_FILE, 5),
-                ("b.md".to_owned(), RV_FILE_TYPE_FILE, 0),
-            ]
+            misuse,
+            Some("a step called finish after it made a file request")
         );
     }
 
-    #[test]
-    fn file_read_hands_back_the_bytes_inside_the_range() {
-        let ((status, read), misuse) = in_step(|ctx| {
-            let (mut bytes, mut error) = (empty_bytes(), empty_error());
-            // SAFETY: as in the first test.
-            let status = unsafe {
-                file_read(
-                    ctx,
-                    rv_str("/notes/a.md"),
-                    1,
-                    3,
-                    &raw mut bytes,
-                    &raw mut error,
-                )
-            };
-            // SAFETY: the bytes are valid until the next file function of
-            // this step.
-            let read = unsafe { slice::from_raw_parts(bytes.ptr, bytes.len) }.to_vec();
-            (status, read)
-        });
-        assert_eq!((status, misuse), (RV_OK, None));
-        assert_eq!(read, b"ell");
-    }
-
-    #[test]
-    fn a_read_of_an_empty_file_hands_back_no_bytes() {
-        let ((status, len), misuse) = in_step(|ctx| {
-            let (mut bytes, mut error) = (empty_bytes(), empty_error());
-            // SAFETY: as in the first test.
-            let status = unsafe {
-                file_read(
-                    ctx,
-                    rv_str("/notes/b.md"),
-                    0,
-                    u64::MAX,
-                    &raw mut bytes,
-                    &raw mut error,
-                )
-            };
-            (status, bytes.len)
-        });
-        assert_eq!((status, len, misuse), (RV_OK, 0, None));
-    }
-
-    #[test]
-    fn a_denied_path_fails_each_function_with_the_policys_reason() {
-        let (failures, misuse) = in_step(|ctx| {
-            let path = rv_str("/secret");
-            let mut failures = Vec::new();
-            let mut error = empty_error();
-            let (mut stat, mut entries, mut bytes) = (empty_stat(), empty_entries(), empty_bytes());
-            // SAFETY: as in the first test, and each error's text is read
-            // before the next file function.
-            unsafe {
-                let status = file_stat(ctx, path, &raw mut stat, &raw mut error);
-                failures.push((status, error.kind, text(error.text)));
-                let status = file_list(ctx, path, &raw mut entries, &raw mut error);
-                failures.push((status, error.kind, text(error.text)));
-                let status = file_read(ctx, path, 0, 1, &raw mut bytes, &raw mut error);
-                failures.push((status, error.kind, text(error.text)));
-            }
-            failures
-        });
-        assert_eq!(misuse, None);
-        let denied = (
-            RV_ERR_FILE,
-            RV_FILE_ERROR_DENIED,
-            "the mode allows only /notes".to_owned(),
-        );
-        assert_eq!(failures, [denied.clone(), denied.clone(), denied]);
-    }
-
-    /// Calls `file_stat` with `path`, `stat`, and `error`, and returns
-    /// its status beside the misuse recorded.
-    fn stat_with(
-        path: RvStr,
-        stat: *mut RvStat,
-        error: *mut RvFileError,
-    ) -> (RvStatus, Option<&'static str>) {
+    /// Calls `file_stat` with `path`, and returns its status beside the
+    /// request taken and the misuse recorded.
+    fn stat_with(path: RvStr) -> (RvStatus, Option<Request>, Option<&'static str>) {
         // SAFETY: each test hands over only what the function refuses
-        // before it reads or writes through it.
-        in_step(|ctx| unsafe { file_stat(ctx, path, stat, error) })
+        // before it reads through it, or a live path.
+        in_step(|ctx| unsafe { file_stat(ctx, path) })
     }
 
     #[test]
-    fn each_breach_of_a_path_is_a_recorded_misuse() {
-        let (mut stat, mut error) = (empty_stat(), empty_error());
+    fn each_breach_of_a_path_is_a_recorded_misuse_and_takes_no_request() {
         let long = "a".repeat(4097);
         let not_utf8 = [0xff_u8, 0xfe];
         for (path, misuse) in [
@@ -466,142 +397,31 @@ mod tests {
                 "the path is not UTF-8",
             ),
         ] {
-            assert_eq!(
-                stat_with(path, &raw mut stat, &raw mut error),
-                (RV_ERR_MISUSE, Some(misuse))
-            );
+            assert_eq!(stat_with(path), (RV_ERR_MISUSE, None, Some(misuse)));
         }
-        assert_eq!(stat.file_type, 9, "a misuse writes no result");
-        assert_eq!(error.kind, 9, "a misuse writes no error");
     }
 
     #[test]
     fn a_path_of_exactly_4096_bytes_is_within_the_bound() {
-        let (mut stat, mut error) = (empty_stat(), empty_error());
         let longest = format!("/{}", "a".repeat(4095));
         assert_eq!(
-            stat_with(rv_str(&longest), &raw mut stat, &raw mut error),
-            (RV_ERR_FILE, None)
-        );
-    }
-
-    #[test]
-    fn each_struct_to_fill_must_be_there_and_aligned() {
-        let (mut stat, mut error) = (empty_stat(), empty_error());
-        let (mut entries, mut bytes) = (empty_entries(), empty_bytes());
-        let path = rv_str("/notes/a.md");
-        let (stat_at, error_at) = (&raw mut stat, &raw mut error);
-        let (entries_at, bytes_at) = (&raw mut entries, &raw mut bytes);
-        let odd_error = error_at.wrapping_byte_add(1);
-
-        assert_eq!(
-            stat_with(path, ptr::null_mut(), error_at),
-            (
-                RV_ERR_MISUSE,
-                Some("file_stat was handed a NULL stat pointer")
-            )
-        );
-        assert_eq!(
-            stat_with(path, stat_at.wrapping_byte_add(1), error_at),
-            (
-                RV_ERR_MISUSE,
-                Some("file_stat was handed a misaligned stat pointer")
-            )
-        );
-        assert_eq!(
-            stat_with(path, stat_at, ptr::null_mut()),
-            (
-                RV_ERR_MISUSE,
-                Some("file_stat was handed a NULL error pointer")
-            )
-        );
-        assert_eq!(
-            stat_with(path, stat_at, odd_error),
-            (
-                RV_ERR_MISUSE,
-                Some("file_stat was handed a misaligned error pointer")
-            )
-        );
-
-        // SAFETY: each call hands over only what the function refuses
-        // before it reads or writes through it.
-        let list = |entries, error| in_step(|ctx| unsafe { file_list(ctx, path, entries, error) });
-        assert_eq!(
-            list(ptr::null_mut(), error_at),
-            (
-                RV_ERR_MISUSE,
-                Some("file_list was handed a NULL entries pointer")
-            )
-        );
-        assert_eq!(
-            list(entries_at.wrapping_byte_add(1), error_at),
-            (
-                RV_ERR_MISUSE,
-                Some("file_list was handed a misaligned entries pointer")
-            )
-        );
-        assert_eq!(
-            list(entries_at, ptr::null_mut()),
-            (
-                RV_ERR_MISUSE,
-                Some("file_list was handed a NULL error pointer")
-            )
-        );
-        assert_eq!(
-            list(entries_at, odd_error),
-            (
-                RV_ERR_MISUSE,
-                Some("file_list was handed a misaligned error pointer")
-            )
-        );
-
-        // SAFETY: as above.
-        let read =
-            |bytes, error| in_step(|ctx| unsafe { file_read(ctx, path, 0, 1, bytes, error) });
-        assert_eq!(
-            read(ptr::null_mut(), error_at),
-            (
-                RV_ERR_MISUSE,
-                Some("file_read was handed a NULL bytes pointer")
-            )
-        );
-        assert_eq!(
-            read(bytes_at.wrapping_byte_add(1), error_at),
-            (
-                RV_ERR_MISUSE,
-                Some("file_read was handed a misaligned bytes pointer")
-            )
-        );
-        assert_eq!(
-            read(bytes_at, ptr::null_mut()),
-            (
-                RV_ERR_MISUSE,
-                Some("file_read was handed a NULL error pointer")
-            )
-        );
-        assert_eq!(
-            read(bytes_at, odd_error),
-            (
-                RV_ERR_MISUSE,
-                Some("file_read was handed a misaligned error pointer")
-            )
+            stat_with(rv_str(&longest)),
+            (RV_OK, Some(Request::Stat(longest.clone())), None)
         );
     }
 
     #[test]
     fn a_file_function_answers_only_the_open_step_through_its_own_ctx() {
-        let (mut stat, mut error) = (empty_stat(), empty_error());
         let path = rv_str("/notes/a.md");
-        let (stat_at, error_at) = (&raw mut stat, &raw mut error);
 
         // SAFETY: a `ctx` that is not the open step's is refused before
         // anything is read through it.
-        let wrong_ctx =
-            in_step(|_ctx| unsafe { file_stat(ptr::null_mut(), path, stat_at, error_at) });
+        let wrong_ctx = in_step(|_ctx| unsafe { file_stat(ptr::null_mut(), path) });
         assert_eq!(
             wrong_ctx,
             (
                 RV_ERR_MISUSE,
+                None,
                 Some(
                     "a tool call function was handed a ctx other than the open RV_TOOL_CALL step's"
                 )
@@ -610,8 +430,8 @@ mod tests {
 
         let (status, session) = session::open(Verb::PackNew, |ctx| {
             // SAFETY: a call that is not a step is refused before
-            // anything is read or written.
-            unsafe { file_stat(ctx, path, stat_at, error_at) }
+            // anything is read.
+            unsafe { file_stat(ctx, path) }
         });
         assert_eq!(
             (status, session.misuse),
@@ -620,11 +440,129 @@ mod tests {
                 Some("a tool call function was called outside RV_TOOL_CALL")
             )
         );
+        assert_eq!(session.request, None);
 
         // SAFETY: with no call open, the function reads nothing.
-        let closed =
-            session::closed(|| unsafe { file_stat(ptr::null_mut(), path, stat_at, error_at) });
+        let closed = session::closed(|| unsafe { file_stat(ptr::null_mut(), path) });
         assert_eq!(closed, RV_ERR_MISUSE);
-        assert_eq!(stat.file_type, 9, "no misuse wrote a result");
+    }
+
+    #[test]
+    fn the_answer_to_a_stat_holds_the_stat_and_nothing_else() {
+        let answer = Answer::to(&Request::Stat("/notes/a.md".to_owned()), &files());
+        let raw = answer.raw();
+        assert_eq!(
+            (raw.size, raw.status),
+            (size_field::<RvFileAnswer>(), RV_OK)
+        );
+        assert_eq!(
+            (raw.stat.file_type, raw.stat.reserved, raw.stat.len),
+            (RV_FILE_TYPE_FILE, 0, 5)
+        );
+        assert!(raw.entries.ptr.is_null() && raw.entries.len == 0);
+        assert!(raw.bytes.ptr.is_null() && raw.bytes.len == 0);
+        assert!(holds_no_error(&raw));
+
+        let directory = Answer::to(&Request::Stat("notes".to_owned()), &files());
+        assert_eq!(directory.raw().stat.file_type, RV_FILE_TYPE_DIRECTORY);
+    }
+
+    #[test]
+    fn the_answer_to_a_listing_holds_each_entry_with_its_name() {
+        let answer = Answer::to(&Request::List("/notes".to_owned()), &files());
+        let raw = answer.raw();
+        assert_eq!(raw.status, RV_OK);
+        // SAFETY: the entries and their names are valid while `answer`
+        // lives.
+        let listed: Vec<(String, u32, u64)> = unsafe {
+            slice::from_raw_parts(raw.entries.ptr, raw.entries.len)
+                .iter()
+                .map(|entry| (text(entry.name), entry.stat.file_type, entry.stat.len))
+                .collect()
+        };
+        assert_eq!(
+            listed,
+            [
+                ("a.md".to_owned(), RV_FILE_TYPE_FILE, 5),
+                ("b.md".to_owned(), RV_FILE_TYPE_FILE, 0),
+            ]
+        );
+        assert_eq!(
+            (raw.stat.file_type, raw.stat.reserved, raw.stat.len),
+            (0, 0, 0)
+        );
+        assert!(raw.bytes.ptr.is_null() && raw.bytes.len == 0);
+        assert!(holds_no_error(&raw));
+    }
+
+    #[test]
+    fn the_answer_to_a_read_holds_the_bytes_inside_the_range() {
+        let request = Request::Read {
+            path: "/notes/a.md".to_owned(),
+            offset: 1,
+            len: 3,
+        };
+        let answer = Answer::to(&request, &files());
+        let raw = answer.raw();
+        assert_eq!(raw.status, RV_OK);
+        // SAFETY: the bytes are valid while `answer` lives.
+        let read = unsafe { slice::from_raw_parts(raw.bytes.ptr, raw.bytes.len) };
+        assert_eq!(read, b"ell");
+        assert!(raw.entries.ptr.is_null() && raw.entries.len == 0);
+        assert!(holds_no_error(&raw));
+    }
+
+    #[test]
+    fn the_answer_to_a_read_of_an_empty_file_holds_no_bytes() {
+        let request = Request::Read {
+            path: "/notes/b.md".to_owned(),
+            offset: 0,
+            len: u64::MAX,
+        };
+        let raw = Answer::to(&request, &files()).raw();
+        assert_eq!(raw.status, RV_OK);
+        assert!(holds_nothing(&raw) && holds_no_error(&raw));
+    }
+
+    #[test]
+    fn the_answer_to_a_failed_operation_holds_the_error_and_nothing_else() {
+        let answer = Answer::to(&Request::Stat("/absent".to_owned()), &files());
+        let raw = answer.raw();
+        assert_eq!(raw.status, RV_ERR_FILE);
+        // SAFETY: the error's text is valid while `answer` lives.
+        let message = unsafe { text(raw.error.text) };
+        assert_eq!(
+            (raw.error.kind, raw.error.reserved, message.as_str()),
+            (RV_FILE_ERROR_NOT_FOUND, 0, "not found: /absent")
+        );
+        assert!(holds_nothing(&raw));
+    }
+
+    #[test]
+    fn a_denied_path_fails_each_operation_with_the_policys_reason() {
+        let path = "/secret".to_owned();
+        for request in [
+            Request::Stat(path.clone()),
+            Request::List(path.clone()),
+            Request::Read {
+                path: path.clone(),
+                offset: 0,
+                len: 1,
+            },
+        ] {
+            let answer = Answer::to(&request, &files());
+            let raw = answer.raw();
+            // SAFETY: the error's text is valid while `answer` lives.
+            let message = unsafe { text(raw.error.text) };
+            assert_eq!(
+                (raw.status, raw.error.kind, message.as_str()),
+                (
+                    RV_ERR_FILE,
+                    RV_FILE_ERROR_DENIED,
+                    "the mode allows only /notes"
+                ),
+                "{request:?}"
+            );
+        }
     }
 }

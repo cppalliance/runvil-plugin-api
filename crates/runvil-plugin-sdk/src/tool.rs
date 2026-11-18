@@ -5,13 +5,10 @@
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::AtomicPtr;
 use std::task::{Context, Poll};
 
-use runvil_plugin_sys::RvToolCallArgs;
-
-use crate::entry::file;
-use crate::{DirEntry, FileError, Stat};
+use crate::file::{Answer, Request, Requests};
+use crate::{DirEntry, FileFuture, Stat};
 
 /// A tool described as data, which a [`Pack`](crate::Pack) lists in
 /// [`Pack::tools`](crate::Pack::tools).
@@ -64,18 +61,18 @@ impl ToolInfo {
 /// the call's arguments, and the files of the call's run. It borrows from
 /// the call, so a Pack cannot keep it past the call's end.
 ///
-/// The file methods read through the Host, so the run's policy applies to
-/// every read, and a read the policy denies fails like any other. Each
-/// method returns once the Host has done the read. A path names a file of
-/// the run, with `/` between its segments, is at most 4096 bytes long, and
-/// is taken from the run's root whether or not it begins with `/`. A call
-/// that reads many files awaits [`next_step`] between them every so
-/// often.
+/// The file methods ask the Host, so the run's policy applies to every
+/// read, and a read the policy denies fails like any other. Each method
+/// returns a [`FileFuture`]. Awaiting it ends the step: the Host does the
+/// read, and a later step of the call goes on with the answer. So a file
+/// method is awaited inside the future that
+/// [`Pack::call`](crate::Pack::call) returns. Code that runs in
+/// `Pack::call` itself, before that future is first polled, can make the
+/// future of a file method and cannot have its answer.
 ///
-/// A file method works only while a step of its call runs, on the thread
-/// that runs it. It fails on any other thread, such as one started with
-/// `std::thread::scope`, and in a `Drop` that runs while the Host cancels
-/// the call.
+/// A path names a file of the run, with `/` between its segments, is at
+/// most 4096 bytes long, and is taken from the run's root whether or not
+/// it begins with `/`.
 #[derive(Clone, Copy, Debug)]
 pub struct ToolCall<'a> {
     state: &'a CallState,
@@ -104,66 +101,73 @@ impl<'a> ToolCall<'a> {
     /// What `path` names. A link is reported as a link, not as what it
     /// leads to.
     ///
-    /// # Errors
-    /// Returns a [`FileError`] when nothing is at `path`, when the run's
-    /// policy denies the read, or when the Host fails it.
-    pub fn stat(&self, path: &str) -> Result<Stat, FileError> {
-        file::stat(self.state, path)
+    /// The future resolves to a [`FileError`](crate::FileError) when
+    /// nothing is at `path`, when the run's policy denies the read, or
+    /// when the Host fails it.
+    pub fn stat(&self, path: &str) -> FileFuture<'a, Stat> {
+        self.ask(Request::Stat(path.to_owned()), |answer| answer.stat)
     }
 
     /// The entries of the directory at `path`, in no promised order. An
     /// entry that is a link is reported as a link.
     ///
-    /// # Errors
-    /// Returns a [`FileError`] when `path` names no directory, when the
-    /// run's policy denies the read, or when the Host fails it.
-    pub fn list(&self, path: &str) -> Result<Vec<DirEntry>, FileError> {
-        file::list(self.state, path)
+    /// The future resolves to a [`FileError`](crate::FileError) when
+    /// `path` names no directory, when the run's policy denies the read,
+    /// or when the Host fails it.
+    pub fn list(&self, path: &str) -> FileFuture<'a, Vec<DirEntry>> {
+        self.ask(Request::List(path.to_owned()), |answer| answer.entries)
     }
 
     /// The whole contents of the file at `path`. The Host holds them in
     /// memory, so a tool checks [`stat`](ToolCall::stat) first, or uses
     /// [`read_range`](ToolCall::read_range), when the file may be large.
     ///
-    /// # Errors
-    /// Returns a [`FileError`] when `path` names no file, when the run's
-    /// policy denies the read, or when the Host fails it.
-    pub fn read(&self, path: &str) -> Result<Vec<u8>, FileError> {
-        file::read(self.state, path, 0, u64::MAX)
+    /// The future resolves to a [`FileError`](crate::FileError) when
+    /// `path` names no file, when the run's policy denies the read, or
+    /// when the Host fails it.
+    pub fn read(&self, path: &str) -> FileFuture<'a, Vec<u8>> {
+        self.read_range(path, 0, u64::MAX)
     }
 
     /// Up to `len` bytes of the file at `path`, from the byte `offset`
     /// on: fewer when the file ends first, and none when `offset` is at
     /// or past its end.
     ///
-    /// # Errors
-    /// Returns a [`FileError`] when `path` names no file, when the run's
-    /// policy denies the read, or when the Host fails it.
-    pub fn read_range(&self, path: &str, offset: u64, len: u64) -> Result<Vec<u8>, FileError> {
-        file::read(self.state, path, offset, len)
+    /// The future resolves to a [`FileError`](crate::FileError) when
+    /// `path` names no file, when the run's policy denies the read, or
+    /// when the Host fails it.
+    pub fn read_range(&self, path: &str, offset: u64, len: u64) -> FileFuture<'a, Vec<u8>> {
+        let path = path.to_owned();
+        self.ask(Request::Read { path, offset, len }, |answer| answer.bytes)
+    }
+
+    /// The future of `request`, which resolves to what `pick` takes out
+    /// of the Host's answer.
+    fn ask<T>(self, request: Request, pick: fn(Answer) -> T) -> FileFuture<'a, T> {
+        FileFuture::new(&self.state.requests, request, pick)
     }
 }
 
 /// What one tool call keeps for all of its steps: the copies of its tool
-/// name and arguments that a [`ToolCall`] reads, and the step that is
-/// running.
+/// name and arguments that a [`ToolCall`] reads, and the file requests
+/// its file methods make.
 #[derive(Debug)]
 pub(crate) struct CallState {
     pub(crate) tool: String,
     pub(crate) arguments: String,
-    /// The arguments of the step that is running, which hold the Host's
-    /// file functions, or NULL between two steps.
-    pub(crate) step: AtomicPtr<RvToolCallArgs>,
+    /// The call's file requests: its futures queue them, and its steps
+    /// take them to the Host and bring the answers back.
+    pub(crate) requests: Requests,
 }
 
 impl CallState {
-    /// The state of a call of `tool` with `arguments`, with no step
-    /// running.
+    /// The state of a call of `tool` with `arguments`, which has asked
+    /// for no file.
     pub(crate) fn new(tool: &str, arguments: &str) -> CallState {
         CallState {
             tool: tool.to_owned(),
             arguments: arguments.to_owned(),
-            step: AtomicPtr::new(std::ptr::null_mut()),
+            requests: Requests::default(),
         }
     }
 }
@@ -269,7 +273,9 @@ impl std::error::Error for ToolError {}
 ///
 /// A [`Pack::call`](crate::Pack::call) future that does a long job awaits
 /// this every so often, so that no step works for long and the Host can
-/// abandon the call between two steps.
+/// abandon the call between two steps. Awaiting a file method of the
+/// [`ToolCall`] ends the step too, so a job needs this only where it
+/// works for long between two file methods.
 pub fn next_step() -> NextStep {
     NextStep { ended: false }
 }
@@ -297,10 +303,11 @@ impl Future for NextStep {
 #[cfg(test)]
 mod tests {
     use std::future::Future;
-    use std::pin::pin;
+    use std::pin::{Pin, pin};
     use std::task::{Context, Poll, Waker};
 
     use super::{CallState, ToolCall, ToolError, ToolErrorKind, ToolInfo, ToolOutput, next_step};
+    use crate::file::Request;
     use crate::{FileError, FileErrorKind};
 
     #[test]
@@ -321,18 +328,66 @@ mod tests {
         assert_eq!(call.arguments(), r#"{"url":"x"}"#);
     }
 
+    /// Polls `future` once and returns the request the call's next send
+    /// hands the Host.
+    fn asked<T>(state: &CallState, mut future: impl Future<Output = T> + Unpin) -> Request {
+        let mut cx = Context::from_waker(Waker::noop());
+        assert!(Pin::new(&mut future).poll(&mut cx).is_pending());
+        let mut asked = None;
+        state.requests.send(|request| {
+            asked = Some(request.clone());
+            Ok(())
+        });
+        // The Host answers, so that the next request can go out.
+        state
+            .requests
+            .answered(Err(FileError::new(FileErrorKind::Other, "no file")));
+        asked.expect("the first poll queued a request")
+    }
+
     #[test]
-    fn a_file_method_fails_while_no_step_of_its_call_runs() {
+    fn each_file_method_asks_for_what_it_was_called_with() {
         let state = CallState::new("fetch", "{}");
         let call = ToolCall::new(&state);
-        let outside = FileError::new(
-            FileErrorKind::Other,
-            "no step of the tool call is running, so its files are out of reach",
+        assert_eq!(
+            asked(&state, call.stat("/a")),
+            Request::Stat("/a".to_owned())
         );
-        assert_eq!(call.stat("/a"), Err(outside.clone()));
-        assert_eq!(call.list("/"), Err(outside.clone()));
-        assert_eq!(call.read("/a"), Err(outside.clone()));
-        assert_eq!(call.read_range("/a", 0, 1), Err(outside));
+        assert_eq!(asked(&state, call.list("/")), Request::List("/".to_owned()));
+        assert_eq!(
+            asked(&state, call.read("/a")),
+            Request::Read {
+                path: "/a".to_owned(),
+                offset: 0,
+                len: u64::MAX
+            }
+        );
+        assert_eq!(
+            asked(&state, call.read_range("/a", 1, 3)),
+            Request::Read {
+                path: "/a".to_owned(),
+                offset: 1,
+                len: 3
+            }
+        );
+    }
+
+    #[test]
+    fn a_file_method_copies_its_path_when_its_future_is_made() {
+        let state = CallState::new("fetch", "{}");
+        let call = ToolCall::new(&state);
+        let future = {
+            let path = String::from("/gone/before/the/poll");
+            call.read(&path)
+        };
+        assert_eq!(
+            asked(&state, future),
+            Request::Read {
+                path: "/gone/before/the/poll".to_owned(),
+                offset: 0,
+                len: u64::MAX
+            }
+        );
     }
 
     #[test]

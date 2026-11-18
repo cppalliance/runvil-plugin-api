@@ -28,8 +28,8 @@
  *   `RV_MAX_` constants names, and a longer string is a misuse.
  * - A struct or a string that one side passes to the other is valid only
  *   until the function it was passed to returns. The receiver copies what
- *   it keeps. What a file function hands back stays valid until the next
- *   file function or the end of the step, as the section on files says.
+ *   it keeps. The answer to a file request stays valid for the whole step
+ *   that receives it, as the section on files says.
  * - Verb names follow `RV_<OBJECT>_<ACTION>`. Libraries open and close;
  *   Plugins load and unload.
  *
@@ -83,42 +83,52 @@
  *   `call->tool_call` the last step left, and no further step.
  * - A step does a bounded slice of work and returns. A step that works
  *   for long, or blocks, stalls its run, and a run can be canceled only
- *   between steps. `RV_PENDING` is not a way to wait: the Host sends the
- *   next step as soon as the run's other work has had a turn.
+ *   between steps.
+ * - A step that made a file request waits for its answer by returning
+ *   `RV_PENDING`, as the section on files says. `RV_PENDING` is a way
+ *   to wait for nothing else: after a step that made no request, the Host
+ *   sends the next step as soon as the run's other work has had a turn.
  *
  * # Files
  *
- * - A step reads its run's files only through the three file functions in
- *   its `RvToolCallArgs`: `file_stat`, `file_list`, and `file_read`, so
- *   the run's policy applies to every read. This version has no function
- *   that changes a file.
+ * - A tool call reaches its run's files only through the three file
+ *   functions in its `RvToolCallArgs`: `file_stat`, `file_list`, and
+ *   `file_read`, so the run's policy applies to every read. This version
+ *   has no function that changes a file.
+ * - A file function only takes a request. It returns `RV_OK` when the
+ *   Host took the request and `RV_ERR_MISUSE` for a misuse, and it
+ *   fills nothing. The call's next step receives the answer: `answer` in
+ *   that step's `RvToolCallArgs` points to an `RvFileAnswer`. In a
+ *   step that follows no request, `answer` is NULL.
+ * - A call has one request outstanding at a time. A second request in
+ *   one step is a misuse, and so is a request in a step that calls
+ *   `finish`.
+ * - A step that made a request returns `RV_PENDING`. The Host sends
+ *   that call its next step when the answer is ready, and no step before
+ *   then.
+ * - An answer's `status` is `RV_OK` or `RV_ERR_FILE`. With `RV_OK`
+ *   the answer holds what the request asked for, in the one field its
+ *   file function names. With `RV_ERR_FILE` the answer's `error` says
+ *   what went wrong. Every other field of the answer is zero. An
+ *   operation that fails does not fail the tool call: the tool decides
+ *   what its result says.
+ * - The answer, and what it points to, is valid for the step that
+ *   receives it: the bytes, the entries and the names in them, and an
+ *   error's text. All of it belongs to the Host. The Plugin copies what
+ *   it keeps and frees none of it.
+ * - The Host holds an answer in memory, so a Plugin reads a large file in
+ *   ranges.
+ * - When the Host abandons a call, an operation it had taken either
+ *   happened in full or did not happen.
  * - A path names a file of the run, with `/` between its segments, and is
  *   at most `RV_MAX_PATH` bytes long. Every path is taken from the run's
  *   root, whether or not it begins with `/`. An empty segment and a `.`
  *   segment change nothing, a `..` segment steps up one directory, and a
  *   `\` is read as `/`. An empty path, and a path that steps above the
  *   root, fail as file errors.
- * - `file_stat`, and each entry `file_list` hands back, describe a link
- *   and not what it leads to. `file_list` and `file_read` act on what a
- *   link leads to.
- * - The Plugin passes each file function a struct for its result and an
- *   `RvFileError`, both its own, and both required. The function
- *   returns `RV_OK` and fills the result, or returns `RV_ERR_FILE`
- *   and fills the error. A function that returns `RV_ERR_MISUSE` fills
- *   neither. A file function that fails does not fail the tool call: the
- *   tool decides what its result says.
- * - What a file function hands back through those structs belongs to the
- *   Host: the bytes, the entries and the names in them, and an error's
- *   text. Each stays valid until the next file function called through
- *   the same `ctx`, or until the step returns, whichever comes first. The
- *   Plugin copies what it keeps and frees none of it. The Host reads
- *   `path` before it releases what it lent, so a name from a listing may
- *   be part of the next `path`.
- * - The Host holds what it hands back in memory, so a Plugin reads a
- *   large file in ranges.
- * - A file function returns when its operation is done. A tool that
- *   reads many files returns `RV_PENDING` between them now and then, so
- *   that no step works for long.
+ * - The answer to `file_stat`, and each entry in the answer to
+ *   `file_list`, describe a link and not what it leads to. `file_list`
+ *   and `file_read` act on what a link leads to.
  *
  * # Threads and lifetime
  *
@@ -183,8 +193,9 @@
  *   built for, or a struct's `size` is smaller than the Plugin expects.
  * - `RV_PENDING` (7) means a tool call needs another step. Only
  *   `RV_TOOL_CALL` returns it.
- * - `RV_ERR_FILE` (8) means a file function failed. Only a file
- *   function returns it.
+ * - `RV_ERR_FILE` (8) means a file operation failed. No function
+ *   returns it: it is the `status` of an `RvFileAnswer`, whose `error`
+ *   says what went wrong.
  *
  * # Versions
  *
@@ -217,6 +228,7 @@ typedef struct RvStat RvStat;
 typedef struct RvDirEntry RvDirEntry;
 typedef struct RvDirEntries RvDirEntries;
 typedef struct RvFileError RvFileError;
+typedef struct RvFileAnswer RvFileAnswer;
 typedef struct RvPluginInfo RvPluginInfo;
 typedef struct RvPackInfo RvPackInfo;
 typedef struct RvToolInfo RvToolInfo;
@@ -235,7 +247,7 @@ typedef struct RvCall RvCall;
 /**
  * The contract's minor version, which `RvHost` reports.
  */
-#define RV_API_MINOR 4
+#define RV_API_MINOR 5
 
 /**
  * The most bytes in a name segment, a version, or a wire name.
@@ -263,7 +275,8 @@ typedef struct RvCall RvCall;
 #define RV_MAX_RESULT 16777216
 
 /**
- * What every function in the contract returns: zero for success.
+ * What every function in the contract returns, and the `status` of an
+ * `RvFileAnswer`: zero for success.
  */
 typedef uint32_t RvStatus;
 
@@ -286,7 +299,7 @@ typedef uint32_t RvResultKind;
 typedef uint32_t RvFileType;
 
 /**
- * Why a file function failed, in an `RvFileError`. A fixed-width
+ * Why a file operation failed, in an `RvFileError`. A fixed-width
  * integer, as `RvVerb` is.
  */
 typedef uint32_t RvFileErrorKind;
@@ -306,7 +319,7 @@ struct RvStr {
 };
 
 /**
- * A run of bytes, which `file_read` hands back.
+ * A run of bytes, which the answer to `file_read` holds.
  */
 struct RvBytes {
   /**
@@ -320,7 +333,8 @@ struct RvBytes {
 };
 
 /**
- * What a path names, which `file_stat` fills and each `RvDirEntry` holds.
+ * What a path names, which the answer to `file_stat` and each
+ * `RvDirEntry` hold.
  */
 struct RvStat {
   /**
@@ -353,8 +367,8 @@ struct RvDirEntry {
 };
 
 /**
- * The entries of a directory, in no promised order, which `file_list`
- * hands back.
+ * The entries of a directory, in no promised order, which the answer to
+ * `file_list` holds.
  */
 struct RvDirEntries {
   /**
@@ -368,7 +382,7 @@ struct RvDirEntries {
 };
 
 /**
- * Why a file function failed, which the function fills when it returns
+ * Why a file operation failed, in an `RvFileAnswer` whose `status` is
  * `RV_ERR_FILE`.
  */
 struct RvFileError {
@@ -384,6 +398,40 @@ struct RvFileError {
    * What went wrong, in words a model can read.
    */
   struct RvStr text;
+};
+
+/**
+ * The answer to a file request, which the step after the request
+ * receives through `answer` in its `RvToolCallArgs`. The Host fills
+ * the one field the request's file function names, or `error`, and
+ * leaves every other field zero.
+ */
+struct RvFileAnswer {
+  /**
+   * The size of this struct in bytes: `sizeof(RvFileAnswer)`.
+   */
+  uint32_t size;
+  /**
+   * `RV_OK` when the operation succeeded, or `RV_ERR_FILE` with
+   * `error` filled.
+   */
+  RvStatus status;
+  /**
+   * What the path names, in the answer to `file_stat`.
+   */
+  struct RvStat stat;
+  /**
+   * The entries of the directory, in the answer to `file_list`.
+   */
+  struct RvDirEntries entries;
+  /**
+   * The bytes read, in the answer to `file_read`.
+   */
+  struct RvBytes bytes;
+  /**
+   * Why the operation failed, when `status` is `RV_ERR_FILE`.
+   */
+  struct RvFileError error;
 };
 
 /**
@@ -583,8 +631,9 @@ struct RvPackNewArgs {
 
 /**
  * The arguments of `RV_TOOL_CALL`: the tool, its arguments, the
- * function that ends the call, and the file functions. Every step of one
- * call gets the same `tool` and `arguments`.
+ * function that ends the call, the file functions, and the answer to the
+ * file request of the call's last step. Every step of one call gets the
+ * same `tool` and `arguments`.
  */
 struct RvToolCallArgs {
   /**
@@ -614,29 +663,28 @@ struct RvToolCallArgs {
    */
   RvStatus (*finish)(void *ctx, const struct RvToolResult *result);
   /**
-   * Says what `path` names. Fills `stat`. A path longer than
-   * `RV_MAX_PATH` bytes is a misuse, here and in the two functions
-   * below.
+   * Asks what `path` names. The answer holds `stat`. A path longer
+   * than `RV_MAX_PATH` bytes is a misuse, here and in the two
+   * functions below.
    */
-  RvStatus (*file_stat)(void *ctx, struct RvStr path, struct RvStat *stat, struct RvFileError *error);
+  RvStatus (*file_stat)(void *ctx, struct RvStr path);
   /**
-   * Lists the directory at `path`. Fills `entries`.
+   * Asks for the entries of the directory at `path`. The answer holds
+   * `entries`.
    */
-  RvStatus (*file_list)(void *ctx,
-                        struct RvStr path,
-                        struct RvDirEntries *entries,
-                        struct RvFileError *error);
+  RvStatus (*file_list)(void *ctx, struct RvStr path);
   /**
-   * Reads up to `len` bytes of the file at `path`, starting at the byte
-   * `offset`. Fills `bytes`, with fewer than `len` bytes when the file
-   * ends first, and none when `offset` is at or past its end.
+   * Asks for up to `len` bytes of the file at `path`, starting at the
+   * byte `offset`. The answer holds `bytes`, with fewer than `len`
+   * bytes when the file ends first, and none when `offset` is at or
+   * past its end.
    */
-  RvStatus (*file_read)(void *ctx,
-                        struct RvStr path,
-                        uint64_t offset,
-                        uint64_t len,
-                        struct RvBytes *bytes,
-                        struct RvFileError *error);
+  RvStatus (*file_read)(void *ctx, struct RvStr path, uint64_t offset, uint64_t len);
+  /**
+   * The answer to the file request the call's last step made, or NULL
+   * when that step made none.
+   */
+  const struct RvFileAnswer *answer;
 };
 
 /**
@@ -709,8 +757,8 @@ struct RvCall {
 #define RV_PENDING 7
 
 /**
- * A file function failed, and its `error` says how; only a file function
- * returns it.
+ * A file operation failed. No function returns it: it is the `status` of
+ * an `RvFileAnswer`, whose `error` says what went wrong.
  */
 #define RV_ERR_FILE 8
 

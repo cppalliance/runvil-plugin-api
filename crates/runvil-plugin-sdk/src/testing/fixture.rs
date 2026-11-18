@@ -9,8 +9,8 @@ use std::ptr;
 
 use runvil_plugin_sys::{
     RV_ERR_UNSUPPORTED, RV_OK, RV_PACK_DELETE, RV_PACK_NEW, RV_PENDING, RV_PLUGIN_LOAD,
-    RV_TOOL_CALL, RV_TOOL_CANCEL, RvCall, RvFileError, RvLoadArgs, RvPackInfo, RvPackNewArgs,
-    RvPluginInfo, RvStatus, RvStr, RvToolCallArgs, RvToolInfo, RvToolResult,
+    RV_RESULT_UNTRUSTED, RV_TOOL_CALL, RV_TOOL_CANCEL, RvCall, RvLoadArgs, RvPackInfo,
+    RvPackNewArgs, RvPluginInfo, RvStatus, RvStr, RvToolCallArgs, RvToolInfo, RvToolResult,
 };
 
 use super::{Failure, Loaded, load_entry};
@@ -23,6 +23,8 @@ thread_local! {
     pub(super) static DELETES: Cell<usize> = const { Cell::new(0) };
     /// How many `RV_TOOL_CANCEL` calls the fixture on this thread got.
     pub(super) static CANCELS: Cell<usize> = const { Cell::new(0) };
+    /// How many steps the fixture on this thread got with an answer.
+    pub(super) static ANSWERS: Cell<usize> = const { Cell::new(0) };
 }
 
 /// The one rule the fixture breaks.
@@ -84,9 +86,12 @@ pub(super) enum Breach {
     FinishThenPending,
     /// Hands `finish` a NULL result and returns `RV_PENDING`.
     MisuseThenPending,
-    /// Hands `file_stat` a NULL `stat`, then finishes as if nothing
-    /// happened.
-    FileStatNull,
+    /// Makes two file requests in one step and returns `RV_PENDING`.
+    RequestTwice,
+    /// Makes a file request, then finishes in the same step.
+    RequestThenFinish,
+    /// Finishes, then makes a file request in the same step.
+    FinishThenRequest,
 }
 
 /// Loads the fixture on this thread with `breach` as its script.
@@ -223,6 +228,12 @@ unsafe fn pack_new(call: *mut RvCall, args: &RvPackNewArgs, breach: Breach) -> R
         description: rv_str("Another fixture tool."),
         ..tool_info(Breach::None)
     };
+    let asks = RvToolInfo {
+        name: rv_str("asks"),
+        wire_name: rv_str(""),
+        description: rv_str("A fixture tool that reads a file."),
+        ..tool_info(Breach::None)
+    };
     // SAFETY: the open call's own functions, and structs that outlive each
     // call.
     unsafe {
@@ -240,6 +251,7 @@ unsafe fn pack_new(call: *mut RvCall, args: &RvPackNewArgs, breach: Breach) -> R
             (args.add_tool)(ctx, &raw const first);
         }
         (args.add_tool)(ctx, &raw const other);
+        (args.add_tool)(ctx, &raw const asks);
         (*call).pack_run = dangling();
     }
     RV_OK
@@ -247,6 +259,7 @@ unsafe fn pack_new(call: *mut RvCall, args: &RvPackNewArgs, breach: Breach) -> R
 
 /// Answers `RV_TOOL_CALL`. The tool `other` returns `RV_PENDING` twice
 /// before it finishes, counting its steps in `call->tool_call`. The tool
+/// `asks` reads the file its arguments name, in two steps. The tool
 /// `tool` finishes at once, with the kind its arguments spell, and its
 /// name and arguments as the text.
 ///
@@ -256,6 +269,13 @@ unsafe fn tool_call(call: *mut RvCall, args: &RvToolCallArgs, breach: Breach) ->
     // SAFETY: the Host keeps both strings valid for the step, and the fake
     // Host only ever sends UTF-8.
     let (tool, arguments) = unsafe { (text(args.tool), text(args.arguments)) };
+    if !args.answer.is_null() {
+        ANSWERS.set(ANSWERS.get() + 1);
+    }
+    if tool == "asks" {
+        // SAFETY: `call` and `args` are the fake Host's open step.
+        return unsafe { asks(call, args, arguments) };
+    }
     // SAFETY: `call` is the fake Host's open step.
     let steps = unsafe { (*call).tool_call }.addr();
     if tool == "other" && steps < 2 {
@@ -288,13 +308,13 @@ unsafe fn tool_call(call: *mut RvCall, args: &RvToolCallArgs, breach: Breach) ->
                 (args.finish)(args.ctx, ptr::null());
                 return RV_PENDING;
             }
-            Breach::FileStatNull => {
-                let mut error = RvFileError {
-                    kind: 0,
-                    reserved: 0,
-                    text: rv_str(""),
-                };
-                (args.file_stat)(args.ctx, rv_str("/a"), ptr::null_mut(), &raw mut error);
+            Breach::RequestTwice => {
+                (args.file_stat)(args.ctx, rv_str("/a"));
+                (args.file_stat)(args.ctx, rv_str("/a"));
+                return RV_PENDING;
+            }
+            Breach::RequestThenFinish => {
+                (args.file_stat)(args.ctx, rv_str("/a"));
             }
             _ => {}
         }
@@ -302,9 +322,48 @@ unsafe fn tool_call(call: *mut RvCall, args: &RvToolCallArgs, breach: Breach) ->
         if breach == Breach::FinishTwice {
             (args.finish)(ctx, &raw const result);
         }
+        if breach == Breach::FinishThenRequest {
+            (args.file_stat)(args.ctx, rv_str("/a"));
+        }
     }
     if breach == Breach::FinishThenPending {
         return RV_PENDING;
+    }
+    RV_OK
+}
+
+/// Answers a step of the tool `asks`. Its first step asks for the whole
+/// file `path` names and returns `RV_PENDING`. Its second step finishes
+/// with what the answer holds: the file's bytes as text, or the kind and
+/// the text of the error.
+///
+/// # Safety
+/// `call` and `args` are the fake Host's open step.
+unsafe fn asks(call: *mut RvCall, args: &RvToolCallArgs, path: &str) -> RvStatus {
+    // SAFETY: the open step's own functions, a path and a result that
+    // outlive each call, and an answer the fake Host keeps valid for the
+    // step.
+    unsafe {
+        if (*call).tool_call.is_null() {
+            (args.file_read)(args.ctx, rv_str(path), 0, u64::MAX);
+            (*call).tool_call = dangling();
+            return RV_PENDING;
+        }
+        let said = match args.answer.as_ref() {
+            None => "no answer".to_owned(),
+            Some(answer) if answer.status == RV_OK => text(RvStr {
+                ptr: answer.bytes.ptr.cast(),
+                len: answer.bytes.len,
+            })
+            .to_owned(),
+            Some(answer) => format!("{}: {}", answer.error.kind, text(answer.error.text)),
+        };
+        let result = RvToolResult {
+            size: size_field::<RvToolResult>(),
+            kind: RV_RESULT_UNTRUSTED,
+            text: rv_str(&said),
+        };
+        (args.finish)(args.ctx, &raw const result);
     }
     RV_OK
 }

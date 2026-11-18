@@ -5,13 +5,12 @@
 use std::cell::Cell;
 use std::ffi::c_void;
 use std::mem::size_of;
-use std::sync::Arc;
 use std::{ptr, slice};
 
 use runvil_plugin_sys::{RV_ERR_MISUSE, RV_ERR_REFUSED, RV_MAX_LINE, RV_OK, RvStatus, RvStr};
 
-use super::file::Lent;
-use super::{Failure, Files, InsertedPack};
+use super::{Failure, InsertedPack};
+use crate::file::Request;
 use crate::{ToolError, ToolInfo, ToolOutput};
 
 thread_local! {
@@ -51,11 +50,8 @@ pub(super) struct Session {
     pub(super) tools: Vec<ToolInfo>,
     /// The result a step finished its call with.
     pub(super) result: Option<Result<ToolOutput, ToolError>>,
-    /// The tree a step's file functions read.
-    pub(super) files: Arc<Files>,
-    /// What a step's last file function handed the Plugin, which stays
-    /// valid until the next one, or until the step returns.
-    pub(super) lent: Lent,
+    /// The file request a step made.
+    pub(super) request: Option<Request>,
 }
 
 /// The name and version a Plugin gave `describe_plugin`, copied.
@@ -90,24 +86,6 @@ pub(super) fn open(
     verb: Verb,
     send: impl FnOnce(*mut c_void) -> RvStatus,
 ) -> (RvStatus, Box<Session>) {
-    open_over(verb, Arc::default(), send)
-}
-
-/// Sends one step of a tool call, as [`open`] sends a call, with `files`
-/// as the tree its file functions read.
-pub(super) fn open_step(
-    files: Arc<Files>,
-    send: impl FnOnce(*mut c_void) -> RvStatus,
-) -> (RvStatus, Box<Session>) {
-    open_over(Verb::ToolCall, files, send)
-}
-
-/// Sends one call of `verb` over `files`; see [`open`].
-fn open_over(
-    verb: Verb,
-    files: Arc<Files>,
-    send: impl FnOnce(*mut c_void) -> RvStatus,
-) -> (RvStatus, Box<Session>) {
     let session = Box::into_raw(Box::new(Session {
         verb,
         misuse: None,
@@ -116,8 +94,7 @@ fn open_over(
         packs: Vec::new(),
         tools: Vec::new(),
         result: None,
-        files,
-        lent: Lent::default(),
+        request: None,
     }));
     // A call inside a call, on one thread, keeps the outer call's session.
     let outer = OPEN.with(|open| open.replace(session));
@@ -347,55 +324,16 @@ impl Shape {
     }
 }
 
-/// One struct a Plugin hands a function to fill, and what each way of
-/// handing it over wrongly is called.
-pub(super) struct Out {
-    null: &'static str,
-    misaligned: &'static str,
-}
-
-/// The [`Out`] of the struct the function `$function` fills and calls
-/// its `$what`.
-macro_rules! out {
-    ($function:literal, $what:literal) => {
-        $crate::testing::session::Out::new(
-            concat!($function, " was handed a NULL ", $what, " pointer"),
-            concat!($function, " was handed a misaligned ", $what, " pointer"),
-        )
-    };
-}
-pub(super) use out;
-
-impl Out {
-    /// An out struct with the name of each breach.
-    pub(super) const fn new(null: &'static str, misaligned: &'static str) -> Out {
-        Out { null, misaligned }
-    }
-
-    /// `at`, once it is known to be a place a `T` can be written to. It
-    /// reads nothing.
-    pub(super) fn check<T>(&self, at: *mut T) -> Result<*mut T, &'static str> {
-        if at.is_null() {
-            return Err(self.null);
-        }
-        if !at.is_aligned() {
-            return Err(self.misaligned);
-        }
-        Ok(at)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::ptr;
 
-    use runvil_plugin_sys::{RvPluginInfo, RvStat, RvStr};
+    use runvil_plugin_sys::{RvPluginInfo, RvStr};
 
-    use super::{Field, Out, Shape};
+    use super::{Field, Shape};
 
     const WORD: Field = field!("the word", 4);
     const INFO: Shape = shape!("describe_plugin", "info", "RvPluginInfo");
-    const STAT: Out = out!("file_stat", "stat");
 
     fn rv_str(bytes: &[u8]) -> RvStr {
         RvStr {
@@ -465,25 +403,6 @@ mod tests {
         assert_eq!(
             short.unwrap_err(),
             "the info's size is shorter than RvPluginInfo"
-        );
-    }
-
-    #[test]
-    fn an_out_names_each_way_a_struct_to_fill_is_handed_over_wrongly() {
-        let mut stat = RvStat {
-            file_type: 0,
-            reserved: 0,
-            len: 0,
-        };
-        let at = &raw mut stat;
-        assert_eq!(STAT.check(at), Ok(at));
-        assert_eq!(
-            STAT.check(ptr::null_mut::<RvStat>()),
-            Err("file_stat was handed a NULL stat pointer")
-        );
-        assert_eq!(
-            STAT.check(at.wrapping_byte_add(1)),
-            Err("file_stat was handed a misaligned stat pointer")
         );
     }
 }

@@ -22,8 +22,8 @@ use crate::{DirEntry, FileError, FileErrorKind, FileType, Stat};
 /// root, fail.
 ///
 /// [`stat`](Files::stat), [`list`](Files::list), and
-/// [`read`](Files::read) answer as the fake Host's file functions do, for
-/// a test that runs a tool's own code with no Plugin around it.
+/// [`read`](Files::read) answer as the fake Host answers a file request,
+/// for a test that runs a tool's own code with no Plugin around it.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Files {
     /// Every node but the root, by its resolved path.
@@ -37,7 +37,7 @@ enum Node {
     File(Vec<u8>),
     /// A directory.
     Directory,
-    /// Something every file function fails on, with this error.
+    /// Something every file operation fails on, with this error.
     Fails(FileError),
 }
 
@@ -70,7 +70,7 @@ impl Files {
         self.with(path, Node::Directory)
     }
 
-    /// The tree with something at `path` that every file function fails
+    /// The tree with something at `path` that every file operation fails
     /// on with `error`, as a path the run's policy denies does. Its
     /// directory lists it as an empty file.
     ///
@@ -110,7 +110,7 @@ impl Files {
         self
     }
 
-    /// What `path` names, as `file_stat` reports it.
+    /// What `path` names, as the answer to `file_stat` reports it.
     ///
     /// # Errors
     /// Returns a [`FileError`] when nothing is at `path`, or when the
@@ -123,8 +123,8 @@ impl Files {
         })
     }
 
-    /// The entries of the directory at `path`, sorted by name, as
-    /// `file_list` reports them.
+    /// The entries of the directory at `path`, sorted by name, as the
+    /// answer to `file_list` reports them.
     ///
     /// # Errors
     /// Returns a [`FileError`] when `path` names no directory, or when
@@ -153,7 +153,7 @@ impl Files {
     }
 
     /// Up to `len` bytes of the file at `path` from the byte `offset` on,
-    /// as `file_read` reports them.
+    /// as the answer to `file_read` reports them.
     ///
     /// # Errors
     /// Returns a [`FileError`] when `path` names no file, or when the
@@ -371,7 +371,7 @@ mod tests {
     }
 
     #[test]
-    fn a_path_told_to_fail_fails_every_function_with_its_error() {
+    fn a_path_told_to_fail_fails_every_operation_with_its_error() {
         let tree = tree();
         assert_eq!(tree.stat("/notes/secret"), Err(denied()));
         assert_eq!(tree.list("/notes/secret"), Err(denied()));

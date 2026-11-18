@@ -74,6 +74,14 @@ pub trait Pack: Send + Sync + 'static {
     /// run, and the Host can abandon a call only between steps, which
     /// drops the future.
     ///
+    /// The future reaches the run's files through the file methods of
+    /// `call`. Awaiting one ends the step with a request to the Host, and
+    /// the Host sends the next step when the answer is ready. An answer
+    /// comes only with a step, so a file method is awaited inside the
+    /// returned future. This function returns before that future is first
+    /// polled, so it can make the future of a file method and cannot have
+    /// its answer.
+    ///
     /// A panic in the future ends the call as a failure and never unwinds
     /// into the Host.
     ///
