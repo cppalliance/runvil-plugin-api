@@ -29,12 +29,17 @@ pub struct ToolInfo {
     /// The tool's parameters: the JSON text of a JSON Schema whose value
     /// is an object, at most 65536 bytes.
     pub parameters: String,
+    /// Whether a call of the tool changes files of its run. Of the calls
+    /// that one reply of a model asks for, the Host runs a call of such a
+    /// tool by itself, after the calls the reply lists before it, so two
+    /// changes of one reply happen in the order the reply lists them.
+    pub changes_files: bool,
 }
 
 impl ToolInfo {
     /// A tool named `name`, with the description a model reads and the
     /// JSON text of its parameter schema, under the wire name the Host
-    /// derives.
+    /// derives. It says that its calls change no file.
     #[must_use]
     pub fn new(
         name: impl Into<String>,
@@ -46,6 +51,7 @@ impl ToolInfo {
             wire_name: None,
             description: description.into(),
             parameters: parameters.into(),
+            changes_files: false,
         }
     }
 
@@ -55,6 +61,16 @@ impl ToolInfo {
         self.wire_name = Some(wire_name.into());
         self
     }
+
+    /// Says that a call of the tool changes files of its run. A tool
+    /// that awaits [`ToolCall::write`], [`ToolCall::append`],
+    /// [`ToolCall::mkdir`], [`ToolCall::remove`], [`ToolCall::rename`], or
+    /// [`ToolCall::copy`] says so.
+    #[must_use]
+    pub fn changes_files(mut self) -> ToolInfo {
+        self.changes_files = true;
+        self
+    }
 }
 
 /// What one tool call lends its [`Pack`](crate::Pack): the tool's name,
@@ -62,13 +78,19 @@ impl ToolInfo {
 /// the call, so a Pack cannot keep it past the call's end.
 ///
 /// The file methods ask the Host, so the run's policy applies to every
-/// read, and a read the policy denies fails like any other. Each method
-/// returns a [`FileFuture`]. Awaiting it ends the step: the Host does the
-/// read, and a later step of the call goes on with the answer. So a file
-/// method is awaited inside the future that
+/// operation, and one the policy denies fails like any other. Each
+/// method returns a [`FileFuture`]. Awaiting it ends the step: the Host
+/// performs the operation, and a later step of the call goes on with the
+/// answer. So a file method is awaited inside the future that
 /// [`Pack::call`](crate::Pack::call) returns. Code that runs in
 /// `Pack::call` itself, before that future is first polled, can make the
 /// future of a file method and cannot have its answer.
+///
+/// [`write`](ToolCall::write), [`append`](ToolCall::append),
+/// [`mkdir`](ToolCall::mkdir), [`remove`](ToolCall::remove),
+/// [`rename`](ToolCall::rename), and [`copy`](ToolCall::copy) change the
+/// run's files. A tool that awaits one of them says so in its
+/// [`ToolInfo`], with [`ToolInfo::changes_files`].
 ///
 /// A path names a file of the run, with `/` between its segments, is at
 /// most 4096 bytes long, and is taken from the run's root whether or not
@@ -139,6 +161,83 @@ impl<'a> ToolCall<'a> {
     pub fn read_range(&self, path: &str, offset: u64, len: u64) -> FileFuture<'a, Vec<u8>> {
         let path = path.to_owned();
         self.ask(Request::Read { path, offset, len }, |answer| answer.bytes)
+    }
+
+    /// Writes `bytes` as the whole contents of the file at `path`. The
+    /// file is made when it is absent, with each directory on the way to
+    /// it. One write takes at most
+    /// [`RV_MAX_WRITE`](crate::sys::RV_MAX_WRITE) bytes, which is 16 MiB,
+    /// so a tool writes a longer file with one `write` and then
+    /// [`append`](ToolCall::append) for each further part.
+    ///
+    /// The future resolves to a [`FileError`](crate::FileError) when
+    /// `path` names a directory, when `bytes` is longer than one write
+    /// takes, when the run's policy denies the write, or when the Host
+    /// fails it.
+    pub fn write(&self, path: &str, bytes: impl Into<Vec<u8>>) -> FileFuture<'a, ()> {
+        let (path, bytes) = (path.to_owned(), bytes.into());
+        self.ask(Request::Write { path, bytes }, drop)
+    }
+
+    /// Adds `bytes` to the end of the file at `path`. The file is made
+    /// when it is absent, as [`write`](ToolCall::write) makes it. One
+    /// append takes as many bytes as one write does.
+    ///
+    /// The future resolves to a [`FileError`](crate::FileError) when
+    /// `path` names a directory, when `bytes` is longer than one append
+    /// takes, when the run's policy denies the append, or when the Host
+    /// fails it.
+    pub fn append(&self, path: &str, bytes: impl Into<Vec<u8>>) -> FileFuture<'a, ()> {
+        let (path, bytes) = (path.to_owned(), bytes.into());
+        self.ask(Request::Append { path, bytes }, drop)
+    }
+
+    /// Makes a directory at `path`. With `recursive` each absent
+    /// directory on the way to it is made too, and without it every one
+    /// of them must be there.
+    ///
+    /// The future resolves to a [`FileError`](crate::FileError) when
+    /// something is at `path` already, when the run's policy denies the
+    /// change, or when the Host fails it.
+    pub fn mkdir(&self, path: &str, recursive: bool) -> FileFuture<'a, ()> {
+        let path = path.to_owned();
+        self.ask(Request::Mkdir { path, recursive }, drop)
+    }
+
+    /// Removes the file or the directory at `path`. With `recursive` a
+    /// directory goes with everything in it, and without it a directory
+    /// must be empty.
+    ///
+    /// The future resolves to a [`FileError`](crate::FileError) when
+    /// nothing is at `path`, when a directory has entries and
+    /// `recursive` is off, when the run's policy denies the change, or
+    /// when the Host fails it.
+    pub fn remove(&self, path: &str, recursive: bool) -> FileFuture<'a, ()> {
+        let path = path.to_owned();
+        self.ask(Request::Remove { path, recursive }, drop)
+    }
+
+    /// Moves the file or the directory at `from` to `to`. A directory
+    /// moves with everything in it, and each absent directory on the way
+    /// to `to` is made.
+    ///
+    /// The future resolves to a [`FileError`](crate::FileError) when
+    /// nothing is at `from`, when the run's policy denies the change, or
+    /// when the Host fails it.
+    pub fn rename(&self, from: &str, to: &str) -> FileFuture<'a, ()> {
+        let (from, to) = (from.to_owned(), to.to_owned());
+        self.ask(Request::Rename { from, to }, drop)
+    }
+
+    /// Copies the file at `from` to `to`. The file at `to` is made when
+    /// it is absent, with each directory on the way to it.
+    ///
+    /// The future resolves to a [`FileError`](crate::FileError) when
+    /// `from` names no file, when `to` names a directory, when the run's
+    /// policy denies the change, or when the Host fails it.
+    pub fn copy(&self, from: &str, to: &str) -> FileFuture<'a, ()> {
+        let (from, to) = (from.to_owned(), to.to_owned());
+        self.ask(Request::Copy { from, to }, drop)
     }
 
     /// The future of `request`, which resolves to what `pick` takes out
@@ -321,6 +420,13 @@ mod tests {
     }
 
     #[test]
+    fn a_tool_info_says_its_calls_change_files_only_once_it_is_told_so() {
+        let info = ToolInfo::new("save", "Saves a page.", r#"{"type":"object"}"#);
+        assert!(!info.changes_files);
+        assert!(info.changes_files().changes_files);
+    }
+
+    #[test]
     fn a_tool_call_lends_the_tool_name_and_the_arguments() {
         let state = CallState::new("fetch", r#"{"url":"x"}"#);
         let call = ToolCall::new(&state);
@@ -369,6 +475,52 @@ mod tests {
                 offset: 1,
                 len: 3
             }
+        );
+    }
+
+    #[test]
+    fn each_method_that_changes_files_asks_for_what_it_was_called_with() {
+        let state = CallState::new("save", "{}");
+        let call = ToolCall::new(&state);
+        let (path, from, to) = ("/a".to_owned(), "/a".to_owned(), "/b".to_owned());
+        assert_eq!(
+            asked(&state, call.write("/a", "text")),
+            Request::Write {
+                path: path.clone(),
+                bytes: b"text".to_vec()
+            }
+        );
+        assert_eq!(
+            asked(&state, call.append("/a", vec![0xff_u8])),
+            Request::Append {
+                path: path.clone(),
+                bytes: vec![0xff]
+            }
+        );
+        assert_eq!(
+            asked(&state, call.mkdir("/a", true)),
+            Request::Mkdir {
+                path: path.clone(),
+                recursive: true
+            }
+        );
+        assert_eq!(
+            asked(&state, call.remove("/a", false)),
+            Request::Remove {
+                path,
+                recursive: false
+            }
+        );
+        assert_eq!(
+            asked(&state, call.rename("/a", "/b")),
+            Request::Rename {
+                from: from.clone(),
+                to: to.clone()
+            }
+        );
+        assert_eq!(
+            asked(&state, call.copy("/a", "/b")),
+            Request::Copy { from, to }
         );
     }
 

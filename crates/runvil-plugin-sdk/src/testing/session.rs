@@ -194,7 +194,8 @@ pub(super) fn refuse(ctx: *mut c_void, family: &Family, reason: RvStr) -> RvStat
     })
 }
 
-/// One string's bound, and what each way of breaking it is called.
+/// The bound of one string, or of one run of bytes, and what each way of
+/// breaking it is called.
 pub(super) struct Field {
     cap: usize,
     too_long: &'static str,
@@ -202,9 +203,10 @@ pub(super) struct Field {
     not_utf8: &'static str,
 }
 
-/// The [`Field`] of the string `$what` names, bounded at `$cap` bytes.
-/// The number is a literal, because it is part of the text of a misuse. A
-/// third argument is the contract's limit, which the number must equal.
+/// The [`Field`] of the string, or the run of bytes, `$what` names,
+/// bounded at `$cap` bytes. The number is a literal, because it is part of
+/// the text of a misuse. A third argument is the contract's limit, which
+/// the number must equal.
 macro_rules! field {
     ($what:literal, $cap:literal $(, $limit:expr)?) => {{
         $(const _: () = assert!($cap == $limit);)?
@@ -237,30 +239,39 @@ impl Field {
         }
     }
 
-    /// Copies the string `s` holds. The length is checked against the cap
-    /// before any byte is read, and `s.ptr` is read only when `s.len` is
-    /// nonzero, because `slice::from_raw_parts` with a NULL pointer is
-    /// undefined behavior even at length 0.
+    /// Copies the string `s` holds, which must be UTF-8, under the rules
+    /// of [`Field::bytes`].
     ///
     /// # Safety
     /// When `s.len` is nonzero, `s.ptr` must be valid for reads of `s.len`
     /// bytes for the duration of this call.
     pub(super) unsafe fn read(&self, s: RvStr) -> Result<String, &'static str> {
-        if s.len > self.cap {
+        // SAFETY: the caller's guarantee is that of `Field::bytes`.
+        let bytes = unsafe { self.bytes(s.ptr.cast::<u8>(), s.len) }?;
+        String::from_utf8(bytes).map_err(|_| self.not_utf8)
+    }
+
+    /// Copies the `len` bytes at `ptr`. The length is checked against the
+    /// cap before any byte is read, and `ptr` is read only when `len` is
+    /// nonzero, because `slice::from_raw_parts` with a NULL pointer is
+    /// undefined behavior even at length 0.
+    ///
+    /// # Safety
+    /// When `len` is nonzero, `ptr` must be valid for reads of `len`
+    /// bytes for the duration of this call.
+    pub(super) unsafe fn bytes(&self, ptr: *const u8, len: usize) -> Result<Vec<u8>, &'static str> {
+        if len > self.cap {
             return Err(self.too_long);
         }
-        if s.len == 0 {
-            return Ok(String::new());
+        if len == 0 {
+            return Ok(Vec::new());
         }
-        if s.ptr.is_null() {
+        if ptr.is_null() {
             return Err(self.null_with_length);
         }
-        // SAFETY: `s.ptr` is not NULL and `s.len` is at most the cap, and
-        // the caller guarantees `s.ptr` is valid for `s.len` bytes.
-        let bytes = unsafe { slice::from_raw_parts(s.ptr.cast::<u8>(), s.len) };
-        std::str::from_utf8(bytes)
-            .map(str::to_owned)
-            .map_err(|_| self.not_utf8)
+        // SAFETY: `ptr` is not NULL and `len` is at most the cap, and the
+        // caller guarantees `ptr` is valid for `len` bytes.
+        Ok(unsafe { slice::from_raw_parts(ptr, len) }.to_vec())
     }
 }
 

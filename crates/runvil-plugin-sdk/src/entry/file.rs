@@ -8,7 +8,7 @@ use std::mem::size_of;
 use std::slice;
 
 use runvil_plugin_sys::{
-    RV_ERR_FILE, RV_OK, RvFileAnswer, RvStat, RvStatus, RvStr, RvToolCallArgs,
+    RV_ERR_FILE, RV_OK, RvBytes, RvFileAnswer, RvStat, RvStatus, RvStr, RvToolCallArgs,
 };
 
 use super::rv_str;
@@ -127,16 +127,37 @@ pub(super) unsafe fn send(requests: &Requests, args: &RvToolCallArgs) {
 /// # Safety
 /// `args` belongs to the `RV_TOOL_CALL` step open on this thread.
 unsafe fn hand_over(args: &RvToolCallArgs, request: &Request) -> RvStatus {
-    // SAFETY: the caller passes the open step's arguments, and the path
-    // outlives the call that hands it over.
+    let ctx = args.ctx;
+    // SAFETY: the caller passes the open step's arguments, and the paths
+    // and the bytes outlive the call that hands them over.
     unsafe {
         match request {
-            Request::Stat(path) => (args.file_stat)(args.ctx, rv_str(path)),
-            Request::List(path) => (args.file_list)(args.ctx, rv_str(path)),
+            Request::Stat(path) => (args.file_stat)(ctx, rv_str(path)),
+            Request::List(path) => (args.file_list)(ctx, rv_str(path)),
             Request::Read { path, offset, len } => {
-                (args.file_read)(args.ctx, rv_str(path), *offset, *len)
+                (args.file_read)(ctx, rv_str(path), *offset, *len)
             }
+            Request::Write { path, bytes } => (args.file_write)(ctx, rv_str(path), rv_bytes(bytes)),
+            Request::Append { path, bytes } => {
+                (args.file_append)(ctx, rv_str(path), rv_bytes(bytes))
+            }
+            Request::Mkdir { path, recursive } => {
+                (args.file_mkdir)(ctx, rv_str(path), u32::from(*recursive))
+            }
+            Request::Remove { path, recursive } => {
+                (args.file_remove)(ctx, rv_str(path), u32::from(*recursive))
+            }
+            Request::Rename { from, to } => (args.file_rename)(ctx, rv_str(from), rv_str(to)),
+            Request::Copy { from, to } => (args.file_copy)(ctx, rv_str(from), rv_str(to)),
         }
+    }
+}
+
+/// `bytes` as the contract's pointer and length.
+fn rv_bytes(bytes: &[u8]) -> RvBytes {
+    RvBytes {
+        ptr: bytes.as_ptr(),
+        len: bytes.len(),
     }
 }
 
@@ -192,6 +213,28 @@ mod tests {
 
     const SCHEMA: &str = r#"{"type":"object","properties":{}}"#;
 
+    /// The tools that read, each named for what it does with the path in
+    /// its arguments.
+    const READS: [&str; 9] = [
+        "stat", "list", "read", "head", "twice", "both", "early", "drops", "panics",
+    ];
+
+    /// The tools that change files. `rename` and `copy` take two paths
+    /// with a space between them.
+    const CHANGES: [&str; 11] = [
+        "write",
+        "append",
+        "mkdir",
+        "mkdirs",
+        "remove",
+        "remove-all",
+        "rename",
+        "copy",
+        "huge",
+        "edit",
+        "leaves",
+    ];
+
     /// A Plugin whose tools report what the file methods resolve to.
     struct Reader;
 
@@ -223,13 +266,10 @@ mod tests {
 
     impl Pack for Tools {
         fn tools(&self) -> Vec<ToolInfo> {
-            [
-                "stat", "list", "read", "head", "twice", "both", "early", "leaves", "panics",
-                "drops",
-            ]
-            .into_iter()
-            .map(|name| ToolInfo::new(name, "A tool.", SCHEMA))
-            .collect()
+            let reads = READS.map(|name| ToolInfo::new(name, "A tool.", SCHEMA));
+            let changes =
+                CHANGES.map(|name| ToolInfo::new(name, "A tool.", SCHEMA).changes_files());
+            reads.into_iter().chain(changes).collect()
         }
 
         fn call<'a>(&'a self, call: ToolCall<'a>) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
@@ -237,55 +277,10 @@ mod tests {
             // exists, and awaits it inside that future.
             let early = (call.tool() == "early").then(|| call.read(call.arguments()));
             Box::pin(async move {
-                let path = call.arguments();
-                let text = match call.tool() {
-                    "early" => early
-                        .expect("the future was made before the call's own")
-                        .await
-                        .map(|bytes| format!("{bytes:?}")),
-                    "stat" => call.stat(path).await.map(|stat| format!("{stat:?}")),
-                    "list" => call.list(path).await.map(|entries| format!("{entries:?}")),
-                    "read" => call.read(path).await.map(|bytes| format!("{bytes:?}")),
-                    "head" => call
-                        .read_range(path, 1, 3)
-                        .await
-                        .map(|bytes| format!("{bytes:?}")),
-                    "twice" => {
-                        let first = call.read(path).await;
-                        let second = call.read(path).await;
-                        Ok(format!("{}", first == second && first.is_ok()))
-                    }
-                    "both" => {
-                        // Both requests are queued in one step, and the
-                        // Host takes one of them with each step.
-                        let mut read = call.read(path);
-                        let mut stat = call.stat(path);
-                        queue(&mut read).await;
-                        queue(&mut stat).await;
-                        let stat = stat.await;
-                        let read = read.await;
-                        read.and_then(|bytes| Ok(format!("{bytes:?} {:?}", stat?)))
-                    }
-                    "leaves" => {
-                        // The call ends in the step that queued a request.
-                        let mut unsent = call.read(path);
-                        queue(&mut unsent).await;
-                        Ok("left".to_owned())
-                    }
-                    "drops" => {
-                        // The first request goes to the Host, its future
-                        // is dropped, and a second file is read.
-                        let mut dropped = call.read("/notes/b.md");
-                        queue(&mut dropped).await;
-                        next_step().await;
-                        drop(dropped);
-                        call.read(path).await.map(|bytes| format!("{bytes:?}"))
-                    }
-                    _ => {
-                        let mut unsent = call.read(path);
-                        queue(&mut unsent).await;
-                        panic!("boom after a request was queued");
-                    }
+                let text = match early {
+                    Some(early) => early.await.map(|bytes| format!("{bytes:?}")),
+                    None if READS.contains(&call.tool()) => reads(call).await,
+                    None => changes(call).await.map(|()| "done".to_owned()),
                 };
                 text.map(ToolOutput::untrusted).map_err(|error| {
                     ToolError::new(
@@ -297,7 +292,79 @@ mod tests {
         }
     }
 
-    /// The tree every test below reads.
+    /// What a tool that reads answers for `call`.
+    async fn reads(call: ToolCall<'_>) -> Result<String, FileError> {
+        let path = call.arguments();
+        match call.tool() {
+            "stat" => call.stat(path).await.map(|stat| format!("{stat:?}")),
+            "list" => call.list(path).await.map(|entries| format!("{entries:?}")),
+            "read" => call.read(path).await.map(|bytes| format!("{bytes:?}")),
+            "head" => call
+                .read_range(path, 1, 3)
+                .await
+                .map(|bytes| format!("{bytes:?}")),
+            "twice" => {
+                let first = call.read(path).await;
+                let second = call.read(path).await;
+                Ok(format!("{}", first == second && first.is_ok()))
+            }
+            "both" => {
+                // Both requests are queued in one step, and the Host takes
+                // one of them with each step.
+                let mut read = call.read(path);
+                let mut stat = call.stat(path);
+                queue(&mut read).await;
+                queue(&mut stat).await;
+                let stat = stat.await;
+                let read = read.await;
+                read.and_then(|bytes| Ok(format!("{bytes:?} {:?}", stat?)))
+            }
+            "drops" => {
+                // The first request goes to the Host, its future is
+                // dropped, and a second file is read.
+                let mut dropped = call.read("/notes/b.md");
+                queue(&mut dropped).await;
+                next_step().await;
+                drop(dropped);
+                call.read(path).await.map(|bytes| format!("{bytes:?}"))
+            }
+            _ => {
+                let mut unsent = call.read(path);
+                queue(&mut unsent).await;
+                panic!("boom after a request was queued");
+            }
+        }
+    }
+
+    /// Makes the change the tool of `call` is named for.
+    async fn changes(call: ToolCall<'_>) -> Result<(), FileError> {
+        let path = call.arguments();
+        let (from, to) = path.split_once(' ').unwrap_or((path, ""));
+        match call.tool() {
+            "write" => call.write(path, "written").await,
+            "append" => call.append(path, " more").await,
+            "mkdir" => call.mkdir(path, false).await,
+            "mkdirs" => call.mkdir(path, true).await,
+            "remove" => call.remove(path, false).await,
+            "remove-all" => call.remove(path, true).await,
+            "rename" => call.rename(from, to).await,
+            "copy" => call.copy(from, to).await,
+            "huge" => call.write(path, vec![0; 16_777_217]).await,
+            "edit" => {
+                let mut bytes = call.read(path).await?;
+                bytes.push(b'!');
+                call.write(path, bytes).await
+            }
+            _ => {
+                // The call ends in the step that queued a change.
+                let mut unsent = call.write(path, "never written");
+                queue(&mut unsent).await;
+                Ok(())
+            }
+        }
+    }
+
+    /// The tree every test below starts from.
     fn files() -> Files {
         Files::new()
             .file("/notes/a.md", "hello")
@@ -309,18 +376,46 @@ mod tests {
             )
     }
 
-    /// Calls `tool` on `path` and returns its output, or its failure as
-    /// the kind and the text of the `FileError` behind it.
-    fn run(tool: &str, path: &str) -> Result<String, String> {
+    /// Calls `tool` with `arguments` and returns its output, or its
+    /// failure as the kind and the text of the `FileError` behind it,
+    /// beside the run's files as the call left them.
+    fn ran(tool: &str, arguments: &str) -> (Result<String, String>, Files) {
         let loaded = testing::load::<Reader>().unwrap();
         let pack = loaded.new_pack("acme/reader").unwrap().with_files(files());
-        match pack
-            .call(tool, path)
+        let result = match pack
+            .call(tool, arguments)
             .expect("the call follows the contract")
         {
             Ok(output) => Ok(output.text().to_owned()),
             Err(error) => Err(error.message().to_owned()),
-        }
+        };
+        (result, pack.files().clone())
+    }
+
+    /// What a call of `tool` on `path` answers; see [`ran`].
+    fn run(tool: &str, path: &str) -> Result<String, String> {
+        ran(tool, path).0
+    }
+
+    /// The files a call of `tool` with `arguments` leaves, when the call
+    /// succeeds.
+    fn left(tool: &str, arguments: &str) -> Files {
+        let (result, files) = ran(tool, arguments);
+        assert_eq!(result, Ok("done".to_owned()), "{tool} {arguments}");
+        files
+    }
+
+    /// The whole contents of the file at `path` in `files`.
+    fn contents(files: &Files, path: &str) -> Result<Vec<u8>, FileError> {
+        files.read(path, 0, u64::MAX)
+    }
+
+    /// The failure of an operation that found nothing at `path`.
+    fn absent<T>(path: &str) -> Result<T, FileError> {
+        Err(FileError::new(
+            FileErrorKind::NotFound,
+            format!("not found: {path}"),
+        ))
     }
 
     /// How many steps a call of `tool` on `path` takes to its end.
@@ -428,8 +523,9 @@ mod tests {
 
     #[test]
     fn a_call_that_ends_with_a_request_queued_leaves_none_with_the_host() {
-        // A request in the step that finishes would be a misuse.
-        assert_eq!(run("leaves", "/notes/a.md"), Ok("left".to_owned()));
+        // A request in the step that finishes would be a misuse, and the
+        // write it asked for would show in the files.
+        assert_eq!(left("leaves", "/notes/a.md"), files());
         assert_eq!(steps("leaves", "/notes/a.md"), 1);
 
         let loaded = testing::load::<Reader>().unwrap();
@@ -446,6 +542,121 @@ mod tests {
     #[test]
     fn the_answer_to_a_dropped_future_reaches_no_other_future() {
         assert_eq!(run("drops", "/notes/a.md"), Ok(format!("{:?}", b"hello")));
+    }
+
+    #[test]
+    fn write_and_append_change_the_contents_of_a_file() {
+        let files = left("write", "/notes/new/c.md");
+        assert_eq!(contents(&files, "/notes/new/c.md"), Ok(b"written".to_vec()));
+        let files = left("write", "notes/a.md");
+        assert_eq!(contents(&files, "/notes/a.md"), Ok(b"written".to_vec()));
+        let files = left("append", "/notes/a.md");
+        assert_eq!(contents(&files, "/notes/a.md"), Ok(b"hello more".to_vec()));
+        let files = left("append", "/log.txt");
+        assert_eq!(contents(&files, "/log.txt"), Ok(b" more".to_vec()));
+    }
+
+    #[test]
+    fn mkdir_and_remove_take_their_recursive_flag_to_the_host() {
+        let directory = Ok(Stat::new(FileType::Directory, 0));
+        assert_eq!(left("mkdir", "/made").stat("/made"), directory);
+        assert_eq!(
+            run("mkdir", "/a/b"),
+            Err("NotFound: not found: /a/b".to_owned())
+        );
+        assert_eq!(left("mkdirs", "/a/b").stat("/a/b"), directory);
+
+        let files = left("remove", "/notes/a.md");
+        assert_eq!(files.stat("/notes/a.md"), absent("/notes/a.md"));
+        assert_eq!(
+            run("remove", "/notes"),
+            Err("NotEmpty: directory not empty: /notes".to_owned())
+        );
+        assert_eq!(
+            left("remove-all", "/notes").stat("/notes"),
+            absent("/notes")
+        );
+    }
+
+    #[test]
+    fn rename_and_copy_take_both_of_their_paths_to_the_host() {
+        let files = left("rename", "/notes/a.md /moved/a.md");
+        assert_eq!(contents(&files, "/moved/a.md"), Ok(b"hello".to_vec()));
+        assert_eq!(files.stat("/notes/a.md"), absent("/notes/a.md"));
+
+        let files = left("copy", "/notes/a.md /copied/a.md");
+        assert_eq!(contents(&files, "/copied/a.md"), Ok(b"hello".to_vec()));
+        assert_eq!(contents(&files, "/notes/a.md"), Ok(b"hello".to_vec()));
+    }
+
+    #[test]
+    fn a_change_that_fails_reaches_the_tool_with_its_kind_and_text() {
+        for (tool, arguments, failure) in [
+            ("write", "/secret", "Denied: the mode allows only /notes"),
+            ("write", "/notes", "IsADirectory: is a directory: /notes"),
+            ("append", "/secret", "Denied: the mode allows only /notes"),
+            ("mkdir", "/notes", "AlreadyExists: already exists: /notes"),
+            ("remove", "/absent", "NotFound: not found: /absent"),
+            ("rename", "/absent /x", "NotFound: not found: /absent"),
+            ("copy", "/notes /x", "IsADirectory: is a directory: /notes"),
+        ] {
+            let (result, after) = ran(tool, arguments);
+            assert_eq!(result, Err(failure.to_owned()), "{tool} {arguments}");
+            assert_eq!(after, files(), "{tool} {arguments} left the files alone");
+        }
+    }
+
+    #[test]
+    fn bytes_longer_than_one_write_takes_fail_without_a_misuse() {
+        assert_eq!(
+            run("huge", "/notes/a.md"),
+            Err("Other: the bytes are longer than 16777216 bytes".to_owned())
+        );
+    }
+
+    #[test]
+    fn a_read_and_a_write_of_one_call_take_a_step_each() {
+        let files = left("edit", "/notes/a.md");
+        assert_eq!(contents(&files, "/notes/a.md"), Ok(b"hello!".to_vec()));
+        assert_eq!(steps("edit", "/notes/a.md"), 3);
+    }
+
+    #[test]
+    fn the_calls_of_one_run_read_what_its_earlier_calls_wrote() {
+        let loaded = testing::load::<Reader>().unwrap();
+        let pack = loaded.new_pack("acme/reader").unwrap().with_files(files());
+        assert!(pack.call("write", "/notes/c.md").unwrap().is_ok());
+        assert_eq!(
+            pack.call("read", "/notes/c.md"),
+            Ok(Ok(ToolOutput::untrusted(format!("{:?}", b"written"))))
+        );
+    }
+
+    #[test]
+    fn a_change_the_host_took_has_happened_when_its_call_is_abandoned() {
+        let loaded = testing::load::<Reader>().unwrap();
+        let pack = loaded.new_pack("acme/reader").unwrap().with_files(files());
+        let mut call = pack.start("write", "/notes/c.md");
+        assert_eq!(call.step(), Ok(None));
+        drop(call);
+        assert_eq!(
+            contents(pack.files(), "/notes/c.md"),
+            Ok(b"written".to_vec())
+        );
+    }
+
+    #[test]
+    fn each_tool_that_changes_files_says_so_to_the_host() {
+        let loaded = testing::load::<Reader>().unwrap();
+        let pack = loaded.new_pack("acme/reader").unwrap();
+        for tool in pack.tools() {
+            assert_eq!(
+                tool.changes_files,
+                CHANGES.contains(&tool.name.as_str()),
+                "{}",
+                tool.name
+            );
+        }
     }
 
     unsafe extern "C" fn taking(_ctx: *mut c_void, _path: RvStr) -> RvStatus {
@@ -472,6 +683,22 @@ mod tests {
         RV_ERR_MISUSE
     }
 
+    unsafe extern "C" fn unused_bytes(
+        _ctx: *mut c_void,
+        _path: RvStr,
+        _bytes: RvBytes,
+    ) -> RvStatus {
+        RV_ERR_MISUSE
+    }
+
+    unsafe extern "C" fn unused_flag(_ctx: *mut c_void, _path: RvStr, _recursive: u32) -> RvStatus {
+        RV_ERR_MISUSE
+    }
+
+    unsafe extern "C" fn unused_pair(_ctx: *mut c_void, _from: RvStr, _to: RvStr) -> RvStatus {
+        RV_ERR_MISUSE
+    }
+
     /// The arguments of a step whose `file_stat` is `file_stat`, and
     /// which carries `answer`.
     fn step_args(
@@ -489,6 +716,12 @@ mod tests {
             file_list: refusing,
             file_read: unused_read,
             answer,
+            file_write: unused_bytes,
+            file_append: unused_bytes,
+            file_mkdir: unused_flag,
+            file_remove: unused_flag,
+            file_rename: unused_pair,
+            file_copy: unused_pair,
         }
     }
 

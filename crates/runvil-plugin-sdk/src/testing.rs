@@ -13,16 +13,22 @@
 //! let output = pack.call("fetch", r#"{"url":"https://example.com"}"#).unwrap();
 //! ```
 //!
-//! A tool that reads files gets them from a [`Files`] tree, which
-//! [`PackRun::with_files`] gives the run:
+//! A tool that reads or changes files works on a [`Files`] tree, which
+//! [`PackRun::with_files`] gives the run. Every call of the run works on
+//! the one tree, and [`PackRun::files`] lends it back, so a test reads
+//! what a call left there:
 //!
 //! ```text
 //! let files = Files::new().file("/notes/a.md", "one\ntwo\n");
 //! let pack = loaded.new_pack("acme/notes").unwrap().with_files(files);
+//! pack.call("save", r#"{"path":"/notes/b.md","text":"three\n"}"#).unwrap();
+//! assert_eq!(pack.files().read("/notes/b.md", 0, u64::MAX), Ok(b"three\n".to_vec()));
 //! ```
 //!
 //! The fake Host performs a file request on that tree when the step that
-//! made it has returned, and lends the call's next step the answer.
+//! made it has returned, and lends the call's next step the answer. So
+//! the change of a call that is dropped between those two steps has
+//! happened.
 //!
 //! A Plugin crate enables it from `[dev-dependencies]` only:
 //!
@@ -246,11 +252,19 @@ impl PackRun<'_> {
 
     /// The instance with `files` as the files of its run, in place of a
     /// tree with nothing but its root. Every call made from here on reads
-    /// them.
+    /// and changes them.
     #[must_use]
     pub fn with_files(mut self, files: Files) -> Self {
         self.files = files;
         self
+    }
+
+    /// The files of the run as they are, with every change its calls
+    /// have made. A test reads them after a call, and may change them
+    /// between two calls or two steps, as another task of a run does.
+    #[must_use]
+    pub fn files(&self) -> &Files {
+        &self.files
     }
 
     /// Runs one call of `tool` with `arguments`, the JSON text of its
@@ -342,6 +356,7 @@ impl Call<'_> {
     ///
     /// A file request the step made is performed on the run's [`Files`]
     /// before this returns, and the call's next step is lent the answer.
+    /// A call that is dropped before that step leaves the operation done.
     ///
     /// # Errors
     /// Returns the [`Failure`] the Harness would report, checked in the
@@ -374,6 +389,12 @@ impl Call<'_> {
                 file_list: file::file_list,
                 file_read: file::file_read,
                 answer: lent.as_ref().map_or(ptr::null(), ptr::from_ref),
+                file_write: file::file_write,
+                file_append: file::file_append,
+                file_mkdir: file::file_mkdir,
+                file_remove: file::file_remove,
+                file_rename: file::file_rename,
+                file_copy: file::file_copy,
             };
             call.args = (&raw const args).cast();
             // SAFETY: `load_entry`'s caller guaranteed `entry` follows the

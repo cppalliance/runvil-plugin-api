@@ -25,11 +25,13 @@
  *   beside the `ctx` pointer it takes first.
  * - Strings are a pointer plus a length, UTF-8, not NUL-terminated. Each
  *   string a Plugin passes has a limit in bytes, which one of the
- *   `RV_MAX_` constants names, and a longer string is a misuse.
- * - A struct or a string that one side passes to the other is valid only
- *   until the function it was passed to returns. The receiver copies what
- *   it keeps. The answer to a file request stays valid for the whole step
- *   that receives it, as the section on files says.
+ *   `RV_MAX_` constants names, and a longer string is a misuse. The
+ *   bytes a Plugin passes for a file have such a limit too.
+ * - A struct, a string, or a run of bytes that one side passes to the
+ *   other is valid only until the function it was passed to returns. The
+ *   receiver copies what it keeps. The answer to a file request stays
+ *   valid for the whole step that receives it, as the section on files
+ *   says.
  * - Verb names follow `RV_<OBJECT>_<ACTION>`. Libraries open and close;
  *   Plugins load and unload.
  *
@@ -88,13 +90,21 @@
  *   `RV_PENDING`, as the section on files says. `RV_PENDING` is a way
  *   to wait for nothing else: after a step that made no request, the Host
  *   sends the next step as soon as the run's other work has had a turn.
+ * - A tool whose calls change files sets `RV_TOOL_CHANGES_FILES` in the
+ *   `flags` of its `RvToolInfo`. Of the calls that one reply of a model
+ *   asks for, the Host runs a call of such a tool by itself: the call
+ *   starts when every call the reply lists before it has ended, and the
+ *   calls the reply lists after it start when it has ended. So two
+ *   changes of one reply happen in the order the reply lists them. The
+ *   calls of tools without the flag may run at the same time.
  *
  * # Files
  *
- * - A tool call reaches its run's files only through the three file
- *   functions in its `RvToolCallArgs`: `file_stat`, `file_list`, and
- *   `file_read`, so the run's policy applies to every read. This version
- *   has no function that changes a file.
+ * - A tool call reaches its run's files only through the nine file
+ *   functions in its `RvToolCallArgs`, so the run's policy applies to
+ *   every operation. `file_stat`, `file_list`, and `file_read` read.
+ *   `file_write`, `file_append`, `file_mkdir`, `file_remove`,
+ *   `file_rename`, and `file_copy` change the files.
  * - A file function only takes a request. It returns `RV_OK` when the
  *   Host took the request and `RV_ERR_MISUSE` for a misuse, and it
  *   fills nothing. The call's next step receives the answer: `answer` in
@@ -108,16 +118,22 @@
  *   then.
  * - An answer's `status` is `RV_OK` or `RV_ERR_FILE`. With `RV_OK`
  *   the answer holds what the request asked for, in the one field its
- *   file function names. With `RV_ERR_FILE` the answer's `error` says
- *   what went wrong. Every other field of the answer is zero. An
- *   operation that fails does not fail the tool call: the tool decides
- *   what its result says.
+ *   file function names. A function that changes the files names no
+ *   field, so its answer holds a status alone. With `RV_ERR_FILE` the
+ *   answer's `error` says what went wrong. Every other field of the
+ *   answer is zero. An operation that fails does not fail the tool call:
+ *   the tool decides what its result says.
  * - The answer, and what it points to, is valid for the step that
  *   receives it: the bytes, the entries and the names in them, and an
  *   error's text. All of it belongs to the Host. The Plugin copies what
  *   it keeps and frees none of it.
  * - The Host holds an answer in memory, so a Plugin reads a large file in
- *   ranges.
+ *   ranges. `file_write` and `file_append` take at most `RV_MAX_WRITE`
+ *   bytes, so a Plugin writes a longer file as one `file_write` and then
+ *   one `file_append` for each further part.
+ * - `file_write`, `file_append`, `file_rename`, and `file_copy` make each
+ *   directory that is absent on the way to the path they write, and
+ *   `file_mkdir` does when its `recursive` is 1.
  * - When the Host abandons a call, an operation it had taken either
  *   happened in full or did not happen.
  * - A path names a file of the run, with `/` between its segments, and is
@@ -127,8 +143,9 @@
  *   `\` is read as `/`. An empty path, and a path that steps above the
  *   root, fail as file errors.
  * - The answer to `file_stat`, and each entry in the answer to
- *   `file_list`, describe a link and not what it leads to. `file_list`
- *   and `file_read` act on what a link leads to.
+ *   `file_list`, describe a link and not what it leads to. `file_mkdir`,
+ *   `file_remove`, and `file_rename` act on a link itself. Every other
+ *   file function acts on what a link leads to.
  *
  * # Threads and lifetime
  *
@@ -211,9 +228,9 @@
  *   that has a `size` field, which shows whether the field is there, such
  *   as a function at the end of a verb's arguments struct; a verb with an
  *   arguments struct of its own; or a number for a result kind, a file
- *   type, or a file error kind. A struct with no `size` field never
- *   changes. A Plugin built for 1.n loads in a Host that reports major
- *   version 1 and a minor version of at least n.
+ *   type, a file error kind, or a tool flag. A struct with no `size`
+ *   field never changes. A Plugin built for 1.n loads in a Host that
+ *   reports major version 1 and a minor version of at least n.
  */
 
 #ifndef RUNVIL_PLUGIN_H
@@ -275,6 +292,11 @@ typedef struct RvCall RvCall;
 #define RV_MAX_RESULT 16777216
 
 /**
+ * The most bytes `file_write` or `file_append` takes in one request.
+ */
+#define RV_MAX_WRITE 16777216
+
+/**
  * What every function in the contract returns, and the `status` of an
  * `RvFileAnswer`: zero for success.
  */
@@ -305,6 +327,13 @@ typedef uint32_t RvFileType;
 typedef uint32_t RvFileErrorKind;
 
 /**
+ * What a tool does beyond answering its calls, in the `flags` of an
+ * `RvToolInfo`: one bit for each `RV_TOOL_` constant. A fixed-width
+ * integer, as `RvVerb` is.
+ */
+typedef uint32_t RvToolFlags;
+
+/**
  * A UTF-8 string that is not NUL-terminated.
  */
 struct RvStr {
@@ -319,7 +348,8 @@ struct RvStr {
 };
 
 /**
- * A run of bytes, which the answer to `file_read` holds.
+ * A run of bytes: what `file_write` and `file_append` take, and what the
+ * answer to `file_read` holds.
  */
 struct RvBytes {
   /**
@@ -490,9 +520,10 @@ struct RvToolInfo {
    */
   uint32_t size;
   /**
-   * Zero.
+   * Zero, or `RV_TOOL_CHANGES_FILES`. A set bit that is no `RV_TOOL_`
+   * constant is a misuse.
    */
-  uint32_t reserved;
+  RvToolFlags flags;
   /**
    * The tool's name within its Pack: one name segment, such as `fetch`.
    */
@@ -664,8 +695,8 @@ struct RvToolCallArgs {
   RvStatus (*finish)(void *ctx, const struct RvToolResult *result);
   /**
    * Asks what `path` names. The answer holds `stat`. A path longer
-   * than `RV_MAX_PATH` bytes is a misuse, here and in the two
-   * functions below.
+   * than `RV_MAX_PATH` bytes is a misuse, here and in every file
+   * function below.
    */
   RvStatus (*file_stat)(void *ctx, struct RvStr path);
   /**
@@ -685,6 +716,45 @@ struct RvToolCallArgs {
    * when that step made none.
    */
   const struct RvFileAnswer *answer;
+  /**
+   * Asks to write `bytes` as the whole contents of the file at `path`.
+   * The file is made when it is absent, and its contents give way to
+   * `bytes` when it is there. More than `RV_MAX_WRITE` bytes are a
+   * misuse, here and in `file_append`.
+   */
+  RvStatus (*file_write)(void *ctx, struct RvStr path, struct RvBytes bytes);
+  /**
+   * Asks to add `bytes` to the end of the file at `path`. The file is
+   * made when it is absent.
+   */
+  RvStatus (*file_append)(void *ctx, struct RvStr path, struct RvBytes bytes);
+  /**
+   * Asks to make a directory at `path`. With `recursive` 0 every
+   * directory on the way to `path` must be there, and with `recursive`
+   * 1 each one that is absent is made. Any other `recursive` is a
+   * misuse, here and in `file_remove`. Something already at `path`
+   * fails the operation as `RV_FILE_ERROR_ALREADY_EXISTS`.
+   */
+  RvStatus (*file_mkdir)(void *ctx, struct RvStr path, uint32_t recursive);
+  /**
+   * Asks to remove the file or the directory at `path`. With
+   * `recursive` 0 a directory that has entries fails the operation as
+   * `RV_FILE_ERROR_NOT_EMPTY`, and with `recursive` 1 it goes with
+   * everything in it. Nothing at `path` fails the operation as
+   * `RV_FILE_ERROR_NOT_FOUND`.
+   */
+  RvStatus (*file_remove)(void *ctx, struct RvStr path, uint32_t recursive);
+  /**
+   * Asks to move the file or the directory at `from` to `to`. A
+   * directory moves with everything in it.
+   */
+  RvStatus (*file_rename)(void *ctx, struct RvStr from, struct RvStr to);
+  /**
+   * Asks to copy the file at `from` to `to`. The file at `to` is made
+   * when it is absent, and its contents give way to the copy when it
+   * is there.
+   */
+  RvStatus (*file_copy)(void *ctx, struct RvStr from, struct RvStr to);
 };
 
 /**
@@ -883,6 +953,23 @@ struct RvCall {
  * The operating system failed the operation.
  */
 #define RV_FILE_ERROR_IO 6
+
+/**
+ * Something is at the path already, where the operation needs nothing
+ * there.
+ */
+#define RV_FILE_ERROR_ALREADY_EXISTS 7
+
+/**
+ * The path names a directory that has entries, where the operation
+ * needs an empty one.
+ */
+#define RV_FILE_ERROR_NOT_EMPTY 8
+
+/**
+ * A call of the tool changes files of its run. Bit 0.
+ */
+#define RV_TOOL_CHANGES_FILES 1
 
 #ifdef __cplusplus
 extern "C" {

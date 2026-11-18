@@ -1,14 +1,14 @@
-//! The file functions a fake Host's `RvToolCallArgs` carries: `file_stat`,
-//! `file_list`, and `file_read`, each checking what the Plugin hands it
-//! as the Harness does and taking one request, and [`Answer`], what the
-//! fake Host lends the step after a request.
+//! The nine file functions a fake Host's `RvToolCallArgs` carries, each
+//! checking what the Plugin hands it as the Harness does and taking one
+//! request, and [`Answer`], what the fake Host lends the step after a
+//! request.
 
 use std::ffi::c_void;
 use std::ptr;
 
 use runvil_plugin_sys::{
-    RV_ERR_FILE, RV_MAX_PATH, RV_OK, RvBytes, RvDirEntries, RvDirEntry, RvFileAnswer, RvFileError,
-    RvStat, RvStatus, RvStr,
+    RV_ERR_FILE, RV_MAX_PATH, RV_MAX_WRITE, RV_OK, RvBytes, RvDirEntries, RvDirEntry, RvFileAnswer,
+    RvFileError, RvStat, RvStatus, RvStr,
 };
 
 use super::Files;
@@ -18,6 +18,12 @@ use crate::file::Request;
 use crate::{DirEntry, FileError, Stat};
 
 const PATH: Field = field!("the path", 4096, RV_MAX_PATH);
+const FROM: Field = field!("the source path", 4096, RV_MAX_PATH);
+const TO: Field = field!("the destination path", 4096, RV_MAX_PATH);
+const BYTES: Field = field!("the run of bytes", 16_777_216, RV_MAX_WRITE);
+
+/// What a `recursive` that is neither 0 nor 1 is called.
+const RECURSIVE: &str = "recursive is neither 0 nor 1";
 
 /// What a second file request in one step is called.
 const SECOND_REQUEST: &str = "a step made a second file request";
@@ -77,6 +83,99 @@ pub(super) unsafe extern "C" fn file_read(
     })
 }
 
+/// Takes a request to write `bytes` as the whole contents of the file at
+/// `path`; returns `RV_OK` or `RV_ERR_MISUSE`.
+pub(super) unsafe extern "C" fn file_write(
+    ctx: *mut c_void,
+    path: RvStr,
+    bytes: RvBytes,
+) -> RvStatus {
+    take(ctx, || {
+        // SAFETY: the contract makes `path` and `bytes` valid for their
+        // lengths during this call.
+        let (path, bytes) = unsafe { (PATH.read(path)?, BYTES.bytes(bytes.ptr, bytes.len)?) };
+        Ok(Request::Write { path, bytes })
+    })
+}
+
+/// Takes a request to add `bytes` to the end of the file at `path`;
+/// returns `RV_OK` or `RV_ERR_MISUSE`.
+pub(super) unsafe extern "C" fn file_append(
+    ctx: *mut c_void,
+    path: RvStr,
+    bytes: RvBytes,
+) -> RvStatus {
+    take(ctx, || {
+        // SAFETY: the contract makes `path` and `bytes` valid for their
+        // lengths during this call.
+        let (path, bytes) = unsafe { (PATH.read(path)?, BYTES.bytes(bytes.ptr, bytes.len)?) };
+        Ok(Request::Append { path, bytes })
+    })
+}
+
+/// Takes a request to make a directory at `path`; returns `RV_OK` or
+/// `RV_ERR_MISUSE`.
+pub(super) unsafe extern "C" fn file_mkdir(
+    ctx: *mut c_void,
+    path: RvStr,
+    recursive: u32,
+) -> RvStatus {
+    take(ctx, || {
+        // SAFETY: the contract makes `path` valid for its length during
+        // this call.
+        let path = unsafe { PATH.read(path) }?;
+        let recursive = flag(recursive)?;
+        Ok(Request::Mkdir { path, recursive })
+    })
+}
+
+/// Takes a request to remove the file or the directory at `path`;
+/// returns `RV_OK` or `RV_ERR_MISUSE`.
+pub(super) unsafe extern "C" fn file_remove(
+    ctx: *mut c_void,
+    path: RvStr,
+    recursive: u32,
+) -> RvStatus {
+    take(ctx, || {
+        // SAFETY: the contract makes `path` valid for its length during
+        // this call.
+        let path = unsafe { PATH.read(path) }?;
+        let recursive = flag(recursive)?;
+        Ok(Request::Remove { path, recursive })
+    })
+}
+
+/// Takes a request to move the file or the directory at `from` to `to`;
+/// returns `RV_OK` or `RV_ERR_MISUSE`.
+pub(super) unsafe extern "C" fn file_rename(ctx: *mut c_void, from: RvStr, to: RvStr) -> RvStatus {
+    take(ctx, || {
+        // SAFETY: the contract makes both paths valid for their lengths
+        // during this call.
+        let (from, to) = unsafe { (FROM.read(from)?, TO.read(to)?) };
+        Ok(Request::Rename { from, to })
+    })
+}
+
+/// Takes a request to copy the file at `from` to `to`; returns `RV_OK`
+/// or `RV_ERR_MISUSE`.
+pub(super) unsafe extern "C" fn file_copy(ctx: *mut c_void, from: RvStr, to: RvStr) -> RvStatus {
+    take(ctx, || {
+        // SAFETY: the contract makes both paths valid for their lengths
+        // during this call.
+        let (from, to) = unsafe { (FROM.read(from)?, TO.read(to)?) };
+        Ok(Request::Copy { from, to })
+    })
+}
+
+/// `recursive` as the contract spells it: 0 for off and 1 for on.
+fn flag(recursive: u32) -> Result<bool, &'static str> {
+    match recursive {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(RECURSIVE),
+    }
+}
+
 /// The answer to one request, with the memory it points into. The fake
 /// Host makes it when the step that asked has returned, and keeps it
 /// until the step that receives it has returned.
@@ -97,14 +196,22 @@ pub(super) struct Answer {
 
 impl Answer {
     /// Performs `request` on `files` and keeps what the operation
-    /// answers: the one thing the request asked for, or its failure.
+    /// answers: the one thing the request asked for, nothing for a
+    /// change, or its failure.
     pub(super) fn to(request: &Request, files: &Files) -> Answer {
+        let done = |outcome: Result<(), FileError>| outcome.map(|()| Answer::empty());
         let found = match request {
             Request::Stat(path) => files.stat(path).map(Answer::of_stat),
             Request::List(path) => files.list(path).map(Answer::of_entries),
             Request::Read { path, offset, len } => {
                 files.read(path, *offset, *len).map(Answer::of_bytes)
             }
+            Request::Write { path, bytes } => done(files.write(path, bytes)),
+            Request::Append { path, bytes } => done(files.append(path, bytes)),
+            Request::Mkdir { path, recursive } => done(files.mkdir(path, *recursive)),
+            Request::Remove { path, recursive } => done(files.remove(path, *recursive)),
+            Request::Rename { from, to } => done(files.rename(from, to)),
+            Request::Copy { from, to } => done(files.copy(from, to)),
         };
         found.unwrap_or_else(Answer::failed)
     }
@@ -222,7 +329,7 @@ fn first<T>(values: &[T]) -> *const T {
     }
 }
 
-/// `stat` as the contract hands it back.
+/// `stat` as an answer holds it.
 fn raw_stat(stat: Stat) -> RvStat {
     RvStat {
         file_type: stat.file_type.raw(),
@@ -240,12 +347,16 @@ mod tests {
     use std::{ptr, slice};
 
     use runvil_plugin_sys::{
-        RV_ERR_FILE, RV_ERR_MISUSE, RV_FILE_ERROR_DENIED, RV_FILE_ERROR_NOT_FOUND,
-        RV_FILE_TYPE_DIRECTORY, RV_FILE_TYPE_FILE, RV_OK, RV_RESULT_TRUSTED, RvFileAnswer,
-        RvStatus, RvStr, RvToolResult,
+        RV_ERR_FILE, RV_ERR_MISUSE, RV_FILE_ERROR_ALREADY_EXISTS, RV_FILE_ERROR_DENIED,
+        RV_FILE_ERROR_NOT_EMPTY, RV_FILE_ERROR_NOT_FOUND, RV_FILE_TYPE_DIRECTORY,
+        RV_FILE_TYPE_FILE, RV_OK, RV_RESULT_TRUSTED, RvBytes, RvFileAnswer, RvStatus, RvStr,
+        RvToolResult,
     };
 
-    use super::{Answer, file_list, file_read, file_stat};
+    use super::{
+        Answer, file_append, file_copy, file_list, file_mkdir, file_read, file_remove, file_rename,
+        file_stat, file_write,
+    };
     use crate::entry::{rv_str, size_field};
     use crate::file::Request;
     use crate::testing::Files;
@@ -284,7 +395,7 @@ mod tests {
     unsafe fn text(s: RvStr) -> String {
         // SAFETY: the caller guarantees the pointer and the length.
         let bytes = unsafe { slice::from_raw_parts(s.ptr.cast::<u8>(), s.len) };
-        String::from_utf8(bytes.to_vec()).expect("the Host hands back UTF-8")
+        String::from_utf8(bytes.to_vec()).expect("the Host lends UTF-8")
     }
 
     /// Whether `answer` holds no stat, no entries, and no bytes.
@@ -322,6 +433,137 @@ mod tests {
             len: 3,
         };
         assert_eq!(read, (RV_OK, Some(request), None));
+    }
+
+    #[test]
+    fn each_file_function_that_changes_files_takes_its_request() {
+        let (path, from, to) = ("/a".to_owned(), "/a".to_owned(), "/b".to_owned());
+        let bytes = RvBytes {
+            ptr: b"text".as_ptr(),
+            len: 4,
+        };
+        // SAFETY: the open step's `ctx`, a live path, and live bytes.
+        let write = in_step(|ctx| unsafe { file_write(ctx, rv_str("/a"), bytes) });
+        let request = Request::Write {
+            path: path.clone(),
+            bytes: b"text".to_vec(),
+        };
+        assert_eq!(write, (RV_OK, Some(request), None));
+        // SAFETY: as above.
+        let append = in_step(|ctx| unsafe { file_append(ctx, rv_str("/a"), bytes) });
+        let request = Request::Append {
+            path: path.clone(),
+            bytes: b"text".to_vec(),
+        };
+        assert_eq!(append, (RV_OK, Some(request), None));
+        // SAFETY: the open step's `ctx` and a live path.
+        let mkdir = in_step(|ctx| unsafe { file_mkdir(ctx, rv_str("/a"), 1) });
+        let request = Request::Mkdir {
+            path: path.clone(),
+            recursive: true,
+        };
+        assert_eq!(mkdir, (RV_OK, Some(request), None));
+        // SAFETY: as above.
+        let remove = in_step(|ctx| unsafe { file_remove(ctx, rv_str("/a"), 0) });
+        let request = Request::Remove {
+            path,
+            recursive: false,
+        };
+        assert_eq!(remove, (RV_OK, Some(request), None));
+        // SAFETY: the open step's `ctx` and two live paths.
+        let rename = in_step(|ctx| unsafe { file_rename(ctx, rv_str("/a"), rv_str("/b")) });
+        let request = Request::Rename {
+            from: from.clone(),
+            to: to.clone(),
+        };
+        assert_eq!(rename, (RV_OK, Some(request), None));
+        // SAFETY: as above.
+        let copy = in_step(|ctx| unsafe { file_copy(ctx, rv_str("/a"), rv_str("/b")) });
+        assert_eq!(copy, (RV_OK, Some(Request::Copy { from, to }), None));
+    }
+
+    #[test]
+    fn each_breach_of_the_bytes_of_a_write_is_a_recorded_misuse() {
+        let byte = 0_u8;
+        for (bytes, misuse) in [
+            (
+                // The length is refused before any byte is read.
+                RvBytes {
+                    ptr: &raw const byte,
+                    len: 16_777_217,
+                },
+                "the run of bytes is longer than 16777216 bytes",
+            ),
+            (
+                RvBytes {
+                    ptr: ptr::null(),
+                    len: 2,
+                },
+                "the run of bytes has a NULL pointer and a nonzero length",
+            ),
+        ] {
+            // SAFETY: the function refuses the bytes before it reads
+            // through them.
+            let write = in_step(|ctx| unsafe { file_write(ctx, rv_str("/a"), bytes) });
+            assert_eq!(write, (RV_ERR_MISUSE, None, Some(misuse)));
+            // SAFETY: as above.
+            let append = in_step(|ctx| unsafe { file_append(ctx, rv_str("/a"), bytes) });
+            assert_eq!(append, (RV_ERR_MISUSE, None, Some(misuse)));
+        }
+        let none = RvBytes {
+            ptr: ptr::null(),
+            len: 0,
+        };
+        // SAFETY: a zero length reads no byte.
+        let empty = in_step(|ctx| unsafe { file_write(ctx, rv_str("/a"), none) });
+        let request = Request::Write {
+            path: "/a".to_owned(),
+            bytes: Vec::new(),
+        };
+        assert_eq!(empty, (RV_OK, Some(request), None));
+    }
+
+    #[test]
+    fn a_recursive_that_is_neither_0_nor_1_is_a_recorded_misuse() {
+        let misuse = Some("recursive is neither 0 nor 1");
+        // SAFETY: the open step's `ctx` and a live path.
+        let mkdir = in_step(|ctx| unsafe { file_mkdir(ctx, rv_str("/a"), 2) });
+        assert_eq!(mkdir, (RV_ERR_MISUSE, None, misuse));
+        // SAFETY: as above.
+        let remove = in_step(|ctx| unsafe { file_remove(ctx, rv_str("/a"), u32::MAX) });
+        assert_eq!(remove, (RV_ERR_MISUSE, None, misuse));
+    }
+
+    #[test]
+    fn each_breach_of_either_path_of_a_move_or_a_copy_is_a_recorded_misuse() {
+        let long = "a".repeat(4097);
+        let not_utf8 = [0xff_u8, 0xfe];
+        let bad = RvStr {
+            ptr: not_utf8.as_ptr().cast(),
+            len: not_utf8.len(),
+        };
+        for (from, to, misuse) in [
+            (
+                rv_str(&long),
+                rv_str("/b"),
+                "the source path is longer than 4096 bytes",
+            ),
+            (
+                rv_str("/a"),
+                rv_str(&long),
+                "the destination path is longer than 4096 bytes",
+            ),
+            (bad, rv_str("/b"), "the source path is not UTF-8"),
+            (rv_str("/a"), bad, "the destination path is not UTF-8"),
+        ] {
+            // SAFETY: the open step's `ctx` and two paths that are live
+            // for their lengths.
+            let rename = in_step(|ctx| unsafe { file_rename(ctx, from, to) });
+            assert_eq!(rename, (RV_ERR_MISUSE, None, Some(misuse)));
+            // SAFETY: as above.
+            let copy = in_step(|ctx| unsafe { file_copy(ctx, from, to) });
+            assert_eq!(copy, (RV_ERR_MISUSE, None, Some(misuse)));
+        }
     }
 
     #[test]
@@ -539,6 +781,88 @@ mod tests {
     }
 
     #[test]
+    fn the_answer_to_a_change_holds_a_status_alone() {
+        let files = files();
+        let write = Request::Write {
+            path: "/notes/c.md".to_owned(),
+            bytes: b"new".to_vec(),
+        };
+        let raw = Answer::to(&write, &files).raw();
+        assert_eq!(raw.status, RV_OK);
+        assert!(holds_nothing(&raw) && holds_no_error(&raw));
+        assert_eq!(files.read("/notes/c.md", 0, u64::MAX), Ok(b"new".to_vec()));
+
+        let mkdir = Request::Mkdir {
+            path: "/notes".to_owned(),
+            recursive: false,
+        };
+        let answer = Answer::to(&mkdir, &files);
+        let raw = answer.raw();
+        // SAFETY: the error's text is valid while `answer` lives.
+        let message = unsafe { text(raw.error.text) };
+        assert_eq!(
+            (raw.status, raw.error.kind, message.as_str()),
+            (
+                RV_ERR_FILE,
+                RV_FILE_ERROR_ALREADY_EXISTS,
+                "already exists: /notes"
+            )
+        );
+        assert!(holds_nothing(&raw));
+    }
+
+    #[test]
+    fn each_change_is_performed_on_the_files() {
+        let files = files();
+        let path = "/notes/a.md".to_owned();
+        for (request, check) in [
+            (
+                Request::Append {
+                    path: path.clone(),
+                    bytes: b"!".to_vec(),
+                },
+                "/notes/a.md",
+            ),
+            (
+                Request::Copy {
+                    from: path.clone(),
+                    to: "/copy.md".to_owned(),
+                },
+                "/copy.md",
+            ),
+            (
+                Request::Rename {
+                    from: path,
+                    to: "/moved.md".to_owned(),
+                },
+                "/moved.md",
+            ),
+        ] {
+            assert_eq!(Answer::to(&request, &files).raw().status, RV_OK);
+            assert_eq!(
+                files.read(check, 0, u64::MAX),
+                Ok(b"hello!".to_vec()),
+                "{request:?}"
+            );
+        }
+        let remove = Request::Remove {
+            path: "/notes".to_owned(),
+            recursive: false,
+        };
+        let raw = Answer::to(&remove, &files).raw();
+        assert_eq!(
+            (raw.status, raw.error.kind),
+            (RV_ERR_FILE, RV_FILE_ERROR_NOT_EMPTY)
+        );
+        let remove = Request::Remove {
+            path: "/notes".to_owned(),
+            recursive: true,
+        };
+        assert_eq!(Answer::to(&remove, &files).raw().status, RV_OK);
+        assert!(files.stat("/notes").is_err());
+    }
+
+    #[test]
     fn a_denied_path_fails_each_operation_with_the_policys_reason() {
         let path = "/secret".to_owned();
         for request in [
@@ -549,8 +873,21 @@ mod tests {
                 offset: 0,
                 len: 1,
             },
+            Request::Write {
+                path: path.clone(),
+                bytes: b"x".to_vec(),
+            },
+            Request::Remove {
+                path: path.clone(),
+                recursive: true,
+            },
+            Request::Copy {
+                from: "/notes/a.md".to_owned(),
+                to: path,
+            },
         ] {
-            let answer = Answer::to(&request, &files());
+            let files = files();
+            let answer = Answer::to(&request, &files);
             let raw = answer.raw();
             // SAFETY: the error's text is valid while `answer` lives.
             let message = unsafe { text(raw.error.text) };
@@ -563,6 +900,7 @@ mod tests {
                 ),
                 "{request:?}"
             );
+            assert_eq!(files, self::files(), "{request:?} left the files alone");
         }
     }
 }

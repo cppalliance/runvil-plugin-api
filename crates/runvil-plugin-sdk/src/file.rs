@@ -14,9 +14,10 @@ use std::sync::{Mutex, MutexGuard, PoisonError};
 use std::task::{Context, Poll};
 
 use runvil_plugin_sys::{
-    RV_FILE_ERROR_CONFLICT, RV_FILE_ERROR_DENIED, RV_FILE_ERROR_IO, RV_FILE_ERROR_IS_A_DIRECTORY,
-    RV_FILE_ERROR_NOT_A_DIRECTORY, RV_FILE_ERROR_NOT_FOUND, RV_FILE_TYPE_DIRECTORY,
-    RV_FILE_TYPE_FILE, RV_FILE_TYPE_SYMLINK, RV_MAX_PATH, RvFileErrorKind, RvFileType,
+    RV_FILE_ERROR_ALREADY_EXISTS, RV_FILE_ERROR_CONFLICT, RV_FILE_ERROR_DENIED, RV_FILE_ERROR_IO,
+    RV_FILE_ERROR_IS_A_DIRECTORY, RV_FILE_ERROR_NOT_A_DIRECTORY, RV_FILE_ERROR_NOT_EMPTY,
+    RV_FILE_ERROR_NOT_FOUND, RV_FILE_TYPE_DIRECTORY, RV_FILE_TYPE_FILE, RV_FILE_TYPE_SYMLINK,
+    RV_MAX_PATH, RV_MAX_WRITE, RvFileErrorKind, RvFileType,
 };
 
 /// What a path names.
@@ -109,14 +110,20 @@ pub enum FileErrorKind {
     NotADirectory,
     /// The path names a directory, where the method needs a file.
     IsADirectory,
-    /// The run's policy does not allow the read. The error's text is the
-    /// policy's own reason.
+    /// The run's policy does not allow the operation. The error's text is
+    /// the policy's own reason.
     Denied,
     /// Another tool call of the run changed the path, or is changing it,
-    /// at the same time. The same read can succeed in a later call.
+    /// at the same time. The same operation can succeed in a later call.
     Conflict,
-    /// The operating system failed the read.
+    /// The operating system failed the operation.
     Io,
+    /// Something is at the path already, where the method needs nothing
+    /// there.
+    AlreadyExists,
+    /// The path names a directory that has entries, where the method
+    /// needs an empty one.
+    NotEmpty,
     /// A reason the other kinds do not name.
     Other,
 }
@@ -132,6 +139,8 @@ impl FileErrorKind {
             RV_FILE_ERROR_DENIED => FileErrorKind::Denied,
             RV_FILE_ERROR_CONFLICT => FileErrorKind::Conflict,
             RV_FILE_ERROR_IO => FileErrorKind::Io,
+            RV_FILE_ERROR_ALREADY_EXISTS => FileErrorKind::AlreadyExists,
+            RV_FILE_ERROR_NOT_EMPTY => FileErrorKind::NotEmpty,
             _ => FileErrorKind::Other,
         }
     }
@@ -146,6 +155,8 @@ impl FileErrorKind {
             FileErrorKind::Denied => RV_FILE_ERROR_DENIED,
             FileErrorKind::Conflict => RV_FILE_ERROR_CONFLICT,
             FileErrorKind::Io => RV_FILE_ERROR_IO,
+            FileErrorKind::AlreadyExists => RV_FILE_ERROR_ALREADY_EXISTS,
+            FileErrorKind::NotEmpty => RV_FILE_ERROR_NOT_EMPTY,
             FileErrorKind::Other => runvil_plugin_sys::RV_FILE_ERROR_OTHER,
         }
     }
@@ -190,8 +201,8 @@ impl fmt::Display for FileError {
 
 impl std::error::Error for FileError {}
 
-/// One file operation a tool call asks its Host for, with a copy of the
-/// path the call named.
+/// One file operation a tool call asks its Host for, with copies of the
+/// paths and the bytes the call named.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum Request {
     /// What the path names.
@@ -207,26 +218,79 @@ pub(crate) enum Request {
         /// The most bytes to read.
         len: u64,
     },
+    /// A write of `bytes` as the whole contents of the file at `path`.
+    Write {
+        /// The file's path.
+        path: String,
+        /// The contents the file gets.
+        bytes: Vec<u8>,
+    },
+    /// An append of `bytes` to the end of the file at `path`.
+    Append {
+        /// The file's path.
+        path: String,
+        /// What the file gains.
+        bytes: Vec<u8>,
+    },
+    /// A new directory at `path`.
+    Mkdir {
+        /// The directory's path.
+        path: String,
+        /// Whether each absent directory on the way to it is made too.
+        recursive: bool,
+    },
+    /// The removal of the file or the directory at `path`.
+    Remove {
+        /// The path to remove.
+        path: String,
+        /// Whether a directory goes with everything in it.
+        recursive: bool,
+    },
+    /// A move of the file or the directory at `from` to `to`.
+    Rename {
+        /// The path to move.
+        from: String,
+        /// Where it moves to.
+        to: String,
+    },
+    /// A copy of the file at `from` to `to`.
+    Copy {
+        /// The file to copy.
+        from: String,
+        /// Where the copy goes.
+        to: String,
+    },
 }
 
 impl Request {
     /// Why the Host would refuse the request as a misuse, when it would:
-    /// its path is longer than the contract allows. A misuse fails the
-    /// whole tool call, so such a request never goes to the Host.
+    /// a path or the bytes are longer than the contract allows. A misuse
+    /// fails the whole tool call, so such a request never goes to the
+    /// Host.
     fn fault(&self) -> Option<FileError> {
-        let (Request::Stat(path) | Request::List(path) | Request::Read { path, .. }) = self;
-        (path.len() > RV_MAX_PATH).then(|| {
-            FileError::new(
-                FileErrorKind::Other,
-                format!("the path is longer than {RV_MAX_PATH} bytes"),
-            )
-        })
+        let (paths, bytes): ([&str; 2], &[u8]) = match self {
+            Request::Stat(path)
+            | Request::List(path)
+            | Request::Read { path, .. }
+            | Request::Mkdir { path, .. }
+            | Request::Remove { path, .. } => ([path, ""], &[]),
+            Request::Write { path, bytes } | Request::Append { path, bytes } => ([path, ""], bytes),
+            Request::Rename { from, to } | Request::Copy { from, to } => ([from, to], &[]),
+        };
+        let fault = if paths.iter().any(|path| path.len() > RV_MAX_PATH) {
+            format!("the path is longer than {RV_MAX_PATH} bytes")
+        } else if bytes.len() > RV_MAX_WRITE {
+            format!("the bytes are longer than {RV_MAX_WRITE} bytes")
+        } else {
+            return None;
+        };
+        Some(FileError::new(FileErrorKind::Other, fault))
     }
 }
 
 /// What the Host answered a request with, copied out of the Host's
 /// memory. The one field the request asked for is filled, and the others
-/// are empty.
+/// are empty. A request that changes the files asked for none.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Answer {
     /// What a path names, for [`Request::Stat`].
@@ -359,14 +423,14 @@ impl Requests {
 /// The future a file method of [`ToolCall`](crate::ToolCall) returns:
 /// one request to the Host, and then the Host's answer.
 ///
-/// The future copies its path when it is made, so it borrows nothing but
-/// its call. Its first poll queues the request, and the step that polled
-/// it ends by handing the oldest queued request of the call to the Host.
-/// The Host holds one request of a call at a time, so further requests
-/// wait their turn, in the order their futures were first polled, and go
-/// out one with each step. The answer arrives with the step after the
-/// request went out, and the future is ready when that step, or a later
-/// one, polls it.
+/// The future copies its paths and its bytes when it is made, so it
+/// borrows nothing but its call. Its first poll queues the request, and
+/// the step that polled it ends by handing the oldest queued request of
+/// the call to the Host. The Host holds one request of a call at a time,
+/// so further requests wait their turn, in the order their futures were
+/// first polled, and go out one with each step. The answer arrives with
+/// the step after the request went out, and the future is ready when
+/// that step, or a later one, polls it.
 ///
 /// A future that is dropped before its request went to the Host sends
 /// nothing. One that is dropped later leaves the operation to happen, and
@@ -458,6 +522,7 @@ const _: () = {
     is_send::<FileFuture<'static, Stat>>();
     is_send::<FileFuture<'static, Vec<DirEntry>>>();
     is_send::<FileFuture<'static, Vec<u8>>>();
+    is_send::<FileFuture<'static, ()>>();
 };
 
 #[cfg(test)]
@@ -653,6 +718,47 @@ mod tests {
     }
 
     #[test]
+    fn bytes_longer_than_the_contract_allows_fail_without_a_request() {
+        let requests = Requests::default();
+        let over = Request::Write {
+            path: "/a".to_owned(),
+            bytes: vec![0; 16_777_217],
+        };
+        let mut long = FileFuture::new(&requests, over, drop);
+        assert_eq!(
+            poll(&mut long),
+            Poll::Ready(Err(FileError::new(
+                FileErrorKind::Other,
+                "the bytes are longer than 16777216 bytes"
+            )))
+        );
+        assert_eq!(sent(&requests), None);
+        let within = Request::Append {
+            path: "/a".to_owned(),
+            bytes: vec![0; 16_777_216],
+        };
+        let mut longest = FileFuture::new(&requests, within, drop);
+        assert_eq!(poll(&mut longest), Poll::Pending);
+        assert!(sent(&requests).is_some());
+    }
+
+    #[test]
+    fn either_path_of_a_move_longer_than_the_contract_allows_fails_without_a_request() {
+        let requests = Requests::default();
+        let long = "a".repeat(4097);
+        let too_long = Poll::Ready(Err(FileError::new(
+            FileErrorKind::Other,
+            "the path is longer than 4096 bytes",
+        )));
+        for (from, to) in [(long.as_str(), "/b"), ("/a", long.as_str())] {
+            let (from, to) = (from.to_owned(), to.to_owned());
+            let mut rename = FileFuture::new(&requests, Request::Rename { from, to }, drop);
+            assert_eq!(poll(&mut rename), too_long);
+        }
+        assert_eq!(sent(&requests), None);
+    }
+
+    #[test]
     fn a_future_polled_after_it_was_ready_fails() {
         let requests = Requests::default();
         let mut future = stat(&requests, "/a");
@@ -691,6 +797,8 @@ mod tests {
             FileErrorKind::Denied,
             FileErrorKind::Conflict,
             FileErrorKind::Io,
+            FileErrorKind::AlreadyExists,
+            FileErrorKind::NotEmpty,
             FileErrorKind::Other,
         ] {
             assert_eq!(FileErrorKind::from_raw(kind.raw()), kind);

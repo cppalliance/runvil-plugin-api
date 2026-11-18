@@ -91,7 +91,8 @@ export_plugin!(Acme);
 - The Pack's name is a vendor and a Pack id joined by `/`. A prompt reaches the tool above as `hello/greet`, the Pack id and the tool's name. A model calls it by its wire name, which is `hello_greet` unless `ToolInfo::wire_name` sets another.
 - Arguments and parameter schemas cross as JSON text, so the SDK needs no JSON library. A Plugin parses `call.arguments()` with one of its own.
 - A tool call is a future the Host polls once per step, and the Host sends the next step without being woken. A call that does a long job awaits `next_step()` every so often, so that no step works for long and the Host can abandon the call between two steps.
-- A tool reads the files of its run through its `ToolCall`: `stat`, `list`, `read`, and `read_range`. Each returns a future, as in `call.read(path).await`. Awaiting it ends the step with a request to the Host, and a later step goes on with the answer, so the run's policy applies to every read. A read that fails resolves to a `FileError` with a kind and the Host's words for what went wrong, and the call goes on, so the tool decides what the model reads. An answer comes only with a step, so a file method is awaited inside the future that `Pack::call` returns. This version has no method that changes a file.
+- A tool reaches the files of its run through its `ToolCall`. `stat`, `list`, `read`, and `read_range` read them, and `write`, `append`, `mkdir`, `remove`, `rename`, and `copy` change them. Each returns a future, as in `call.read(path).await`. Awaiting it ends the step with a request to the Host, and a later step goes on with the answer, so the run's policy applies to every operation. An operation that fails resolves to a `FileError` with a kind and the Host's words for what went wrong, and the call goes on, so the tool decides what the model reads. An answer comes only with a step, so a file method is awaited inside the future that `Pack::call` returns.
+- A tool that changes files says so with `ToolInfo::changes_files()`. Of the calls one reply of a model asks for, the Host runs a call of such a tool by itself, so two changes of one reply happen in the order the reply lists them.
 - A panic in `load` or `new_pack` reaches the Host as a refusal, and a panic in a tool call ends that call as a failure. Neither unwinds into the Host.
 
 ### Testing
@@ -106,16 +107,18 @@ assert_eq!(pack.call("greet", "{}"), Ok(Ok(ToolOutput::trusted("Hello."))));
 
 `load` returns the Plugin's name, version, and Packs, or the failure the Harness would report. `new_pack` returns one run's instance with its tools. `call` runs a tool call to its end, and `start` hands back a call whose steps the test sends one at a time. Dropping each value sends the verb that frees what it stands for.
 
-A tool that reads files gets them from a `Files` tree held in memory:
+A tool that reads or changes files works on a `Files` tree held in memory:
 
 ```rust
 let files = Files::new()
     .file("/notes/a.md", "one\ntwo\n")
     .fails("/secret", FileError::new(FileErrorKind::Denied, "the mode allows only /notes"));
 let pack = loaded.new_pack("acme/notes").unwrap().with_files(files);
+pack.call("save", r#"{"path":"/notes/b.md","text":"three\n"}"#).unwrap();
+assert_eq!(pack.files().read("/notes/b.md", 0, u64::MAX), Ok(b"three\n".to_vec()));
 ```
 
-`file` and `dir` add a node and every directory on the way to it, and `fails` makes every read of a path fail with the error given, as a path the run's policy denies does. A path that fails has nothing under it: `fails` refuses a directory that has entries, because those entries would stay readable. The fake Host performs a file request on the tree once the step that made it has returned, and lends the call's next step the answer.
+`file` and `dir` add a node and every directory on the way to it, and `fails` makes every operation on a path fail with the error given, a change included, as a path the run's policy denies does. A path that fails has nothing under it: `fails` refuses a directory that has entries, because those entries would stay readable, and a change that would make something under it fails with the same error. The calls of one `PackRun` share the tree, and `PackRun::files` lends it to the test, which reads what a call left there. The fake Host performs a file request on the tree once the step that made it has returned, and lends the call's next step the answer.
 
 ### Linked and library builds of one Plugin
 
@@ -123,7 +126,7 @@ A Host can also link a Plugin crate in and pass `runvil_plugin_sdk::entry::<Acme
 
 ## Writing a Plugin in C or C++
 
-Include `runvil_plugin.h` and define `RvStatus runvil_plugin(RvCall *call)`. The header's opening comment is the whole contract: the verbs, who calls what on which thread, and what the Plugin must free on every path. The functions a Plugin may call back come with the verb they serve, in its arguments struct behind `call->args` (an `RvLoadArgs` for `RV_PLUGIN_LOAD`, an `RvPackNewArgs` for `RV_PACK_NEW`, an `RvToolCallArgs` for `RV_TOOL_CALL`), and each takes that struct's `ctx` first. A step of a tool call asks for one of its run's files through `file_stat`, `file_list`, or `file_read` in its `RvToolCallArgs` and returns `RV_PENDING`, and the call's next step finds the answer behind `answer` in its own `RvToolCallArgs`. `tests/c-layout` compiles the header as C99 and as C++ on every CI run.
+Include `runvil_plugin.h` and define `RvStatus runvil_plugin(RvCall *call)`. The header's opening comment is the whole contract: the verbs, who calls what on which thread, and what the Plugin must free on every path. The functions a Plugin may call back come with the verb they serve, in its arguments struct behind `call->args` (an `RvLoadArgs` for `RV_PLUGIN_LOAD`, an `RvPackNewArgs` for `RV_PACK_NEW`, an `RvToolCallArgs` for `RV_TOOL_CALL`), and each takes that struct's `ctx` first. A step of a tool call makes one file request through one of the nine file functions in its `RvToolCallArgs`, such as `file_read` or `file_write`, and returns `RV_PENDING`, and the call's next step finds the answer behind `answer` in its own `RvToolCallArgs`. `tests/c-layout` compiles the header as C99 and as C++ on every CI run.
 
 ## Versions
 

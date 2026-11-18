@@ -22,7 +22,7 @@ const PACK_NAME: Field = field!("the Pack's name", 129, 2 * RV_MAX_NAME + 1);
 const PACK_DESCRIPTION: Field = field!("the Pack's description", 1024, RV_MAX_LINE);
 
 /// What a zero `reserved` field holding anything else is called.
-pub(super) const RESERVED: &str = "the info's reserved field is not zero";
+const RESERVED: &str = "the info's reserved field is not zero";
 
 /// Records the Plugin's refusal to load.
 pub(super) unsafe extern "C" fn refuse(ctx: *mut c_void, reason: RvStr) -> RvStatus {

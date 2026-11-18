@@ -52,13 +52,19 @@
 //! state on the path the contract names, and never lets a panic unwind
 //! into the Host.
 //!
-//! A tool reads the files of its run through its [`ToolCall`]:
-//! [`stat`](ToolCall::stat), [`list`](ToolCall::list),
-//! [`read`](ToolCall::read), and [`read_range`](ToolCall::read_range).
-//! Each returns a [`FileFuture`]. Awaiting it hands the request to the
-//! Host and ends the step, and a later step goes on with the answer. The
-//! run's policy applies to every request, and one that fails resolves to
-//! a [`FileError`] that leaves the call running.
+//! A tool reaches the files of its run through its [`ToolCall`]. It
+//! reads them with [`stat`](ToolCall::stat), [`list`](ToolCall::list),
+//! [`read`](ToolCall::read), and [`read_range`](ToolCall::read_range),
+//! and it changes them with [`write`](ToolCall::write),
+//! [`append`](ToolCall::append), [`mkdir`](ToolCall::mkdir),
+//! [`remove`](ToolCall::remove), [`rename`](ToolCall::rename), and
+//! [`copy`](ToolCall::copy). Each method returns a [`FileFuture`].
+//! Awaiting it hands the request to the Host and ends the step, and a
+//! later step goes on with the answer. The run's policy applies to every
+//! request, and one that fails resolves to a [`FileError`] that leaves
+//! the call running. A tool that changes files says so with
+//! [`ToolInfo::changes_files`], and the Host then runs each of its calls
+//! by itself among the calls one reply of a model asks for.
 //!
 //! The `test-support` feature adds `testing`, a fake Host for a Plugin
 //! crate's own tests.

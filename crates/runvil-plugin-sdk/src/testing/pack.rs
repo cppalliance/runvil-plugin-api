@@ -4,10 +4,11 @@
 
 use std::ffi::c_void;
 
-use runvil_plugin_sys::{RV_MAX_NAME, RV_MAX_TOOL_TEXT, RV_OK, RvStatus, RvStr, RvToolInfo};
+use runvil_plugin_sys::{
+    RV_MAX_NAME, RV_MAX_TOOL_TEXT, RV_OK, RV_TOOL_CHANGES_FILES, RvStatus, RvStr, RvToolInfo,
+};
 
 use super::json;
-use super::load::RESERVED;
 use super::session::{self, Field, PACK_NEW, Shape, answer, field, shape};
 use crate::ToolInfo;
 use crate::names::{is_valid_name, is_valid_wire_name};
@@ -30,8 +31,8 @@ pub(super) unsafe extern "C" fn add_tool(ctx: *mut c_void, info: *const RvToolIn
         // SAFETY: the contract makes `info` point at a readable
         // `RvToolInfo` during this call.
         let info = unsafe { TOOL_INFO.read(info) }?;
-        if info.reserved != 0 {
-            return Err(RESERVED);
+        if info.flags & !RV_TOOL_CHANGES_FILES != 0 {
+            return Err("the tool's flags set a bit that is not one of the RV_TOOL constants");
         }
         // SAFETY: the contract makes each string valid for its length.
         let name = unsafe { TOOL_NAME.read(info.name) }?;
@@ -61,6 +62,7 @@ pub(super) unsafe extern "C" fn add_tool(ctx: *mut c_void, info: *const RvToolIn
             wire_name: (!wire_name.is_empty()).then_some(wire_name),
             description,
             parameters,
+            changes_files: info.flags & RV_TOOL_CHANGES_FILES != 0,
         });
         Ok(RV_OK)
     })
@@ -85,7 +87,7 @@ mod tests {
             pack.tools(),
             [
                 ToolInfo::new("tool", "A fixture tool.", "{}").wire_name("Tool"),
-                ToolInfo::new("other", "Another fixture tool.", "{}"),
+                ToolInfo::new("other", "Another fixture tool.", "{}").changes_files(),
                 ToolInfo::new("asks", "A fixture tool that reads a file.", "{}"),
             ]
         );
@@ -117,6 +119,10 @@ mod tests {
             (
                 Breach::Parameters,
                 "the tool's parameter schema is not the JSON text of an object",
+            ),
+            (
+                Breach::ToolFlags,
+                "the tool's flags set a bit that is not one of the RV_TOOL constants",
             ),
             (
                 Breach::LoadFunctionInPackNew,

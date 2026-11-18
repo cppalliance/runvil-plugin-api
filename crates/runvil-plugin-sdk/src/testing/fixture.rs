@@ -9,8 +9,9 @@ use std::ptr;
 
 use runvil_plugin_sys::{
     RV_ERR_UNSUPPORTED, RV_OK, RV_PACK_DELETE, RV_PACK_NEW, RV_PENDING, RV_PLUGIN_LOAD,
-    RV_RESULT_UNTRUSTED, RV_TOOL_CALL, RV_TOOL_CANCEL, RvCall, RvLoadArgs, RvPackInfo,
-    RvPackNewArgs, RvPluginInfo, RvStatus, RvStr, RvToolCallArgs, RvToolInfo, RvToolResult,
+    RV_RESULT_UNTRUSTED, RV_TOOL_CALL, RV_TOOL_CANCEL, RV_TOOL_CHANGES_FILES, RvCall, RvLoadArgs,
+    RvPackInfo, RvPackNewArgs, RvPluginInfo, RvStatus, RvStr, RvToolCallArgs, RvToolInfo,
+    RvToolResult,
 };
 
 use super::{Failure, Loaded, load_entry};
@@ -66,6 +67,8 @@ pub(super) enum Breach {
     NoDescription,
     /// Adds a tool whose parameters are a JSON array.
     Parameters,
+    /// Adds a tool whose flags set a bit the contract does not name.
+    ToolFlags,
     /// Calls `describe_plugin` during `RV_PACK_NEW`.
     LoadFunctionInPackNew,
     /// Declines to make its Pack instance.
@@ -207,7 +210,7 @@ unsafe fn load_verb(call: *mut RvCall, args: &RvLoadArgs, breach: Breach) -> RvS
 fn tool_info(breach: Breach) -> RvToolInfo {
     RvToolInfo {
         size: size_field::<RvToolInfo>(),
-        reserved: 0,
+        flags: if breach == Breach::ToolFlags { 2 } else { 0 },
         name: text_unless(breach, Breach::ToolName, "tool", "Not A Segment"),
         wire_name: text_unless(breach, Breach::WireName, "Tool", "web/fetch"),
         description: text_unless(breach, Breach::NoDescription, "A fixture tool.", ""),
@@ -223,6 +226,7 @@ unsafe fn pack_new(call: *mut RvCall, args: &RvPackNewArgs, breach: Breach) -> R
     let ctx = ctx_unless(breach, Breach::PackCtx, args.ctx);
     let first = tool_info(breach);
     let other = RvToolInfo {
+        flags: RV_TOOL_CHANGES_FILES,
         name: rv_str("other"),
         wire_name: rv_str(""),
         description: rv_str("Another fixture tool."),

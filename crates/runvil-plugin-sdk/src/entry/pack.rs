@@ -4,7 +4,9 @@
 use std::panic::{self, AssertUnwindSafe};
 use std::ptr;
 
-use runvil_plugin_sys::{RV_ERR_MISUSE, RV_OK, RvCall, RvPackNewArgs, RvStatus, RvStr, RvToolInfo};
+use runvil_plugin_sys::{
+    RV_ERR_MISUSE, RV_OK, RV_TOOL_CHANGES_FILES, RvCall, RvPackNewArgs, RvStatus, RvStr, RvToolInfo,
+};
 
 use super::{args, contain, panic_message, read_str, refuse, rv_str, size_field};
 use crate::pack::PackRun;
@@ -78,7 +80,11 @@ unsafe fn add_tools(args: &RvPackNewArgs, tools: &[ToolInfo]) -> RvStatus {
     for tool in tools {
         let info = RvToolInfo {
             size: size_field::<RvToolInfo>(),
-            reserved: 0,
+            flags: if tool.changes_files {
+                RV_TOOL_CHANGES_FILES
+            } else {
+                0
+            },
             name: rv_str(&tool.name),
             wire_name: tool.wire_name.as_deref().map_or(EMPTY, rv_str),
             description: rv_str(&tool.description),
@@ -202,7 +208,7 @@ mod tests {
         fn tools(&self) -> Vec<ToolInfo> {
             vec![
                 ToolInfo::new("first", "The first tool.", SCHEMA).wire_name("First"),
-                ToolInfo::new("second", "The second tool.", SCHEMA),
+                ToolInfo::new("second", "The second tool.", SCHEMA).changes_files(),
             ]
         }
 
@@ -257,9 +263,10 @@ mod tests {
             pack.tools(),
             [
                 ToolInfo::new("first", "The first tool.", SCHEMA).wire_name("First"),
-                ToolInfo::new("second", "The second tool.", SCHEMA),
+                ToolInfo::new("second", "The second tool.", SCHEMA).changes_files(),
             ]
         );
+        assert!(!pack.tools()[0].changes_files, "no flag unless it is set");
         drop(pack);
         assert_eq!(COUNTED_LIVE.load(Ordering::SeqCst), 0);
     }
