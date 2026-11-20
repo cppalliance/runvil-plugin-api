@@ -106,9 +106,13 @@ fn stat_of(stat: RvStat) -> Stat {
 /// Host already. A request the Host does not take fails its future with
 /// the status the Host returned.
 ///
+/// Returns whether the Host refused a request. The failure is then the
+/// answer its future gets, and no step is due to bring it, so the step
+/// wakes its call.
+///
 /// # Safety
 /// `args` belongs to the `RV_TOOL_CALL` step open on this thread.
-pub(super) unsafe fn send(requests: &Requests, args: &RvToolCallArgs) {
+pub(super) unsafe fn send(requests: &Requests, args: &RvToolCallArgs) -> bool {
     requests.send(|request| {
         // SAFETY: the caller passes the open step's arguments.
         match unsafe { hand_over(args, request) } {
@@ -118,7 +122,7 @@ pub(super) unsafe fn send(requests: &Requests, args: &RvToolCallArgs) {
                 format!("the Host answered the file function with status {status}"),
             )),
         }
-    });
+    })
 }
 
 /// Calls the file function of the step `args` that takes `request`, and
@@ -191,19 +195,19 @@ unsafe fn text(s: RvStr) -> String {
 #[cfg(test)]
 mod tests {
     use std::ffi::c_void;
-    use std::future::{Future, poll_fn};
+    use std::future::{Future, pending, poll_fn};
     use std::pin::Pin;
     use std::ptr;
     use std::task::{Context, Poll, Waker};
 
     use runvil_plugin_sys::{
         RV_ERR_FILE, RV_ERR_MISUSE, RV_FILE_ERROR_DENIED, RV_FILE_TYPE_FILE, RV_OK, RV_PENDING,
-        RvBytes, RvDirEntries, RvFileAnswer, RvFileError, RvStat, RvStatus, RvStr, RvToolCallArgs,
-        RvToolResult, RvWaker,
+        RV_TOOL_CALL, RvBytes, RvCall, RvDirEntries, RvFileAnswer, RvFileError, RvStat, RvStatus,
+        RvStr, RvToolCallArgs, RvToolResult, RvWaker,
     };
 
     use super::{receive, send, text};
-    use crate::entry::{rv_str, size_field};
+    use crate::entry::{entry, rv_str, size_field};
     use crate::testing::{self, Files};
     use crate::tool::CallState;
     use crate::{
@@ -215,8 +219,8 @@ mod tests {
 
     /// The tools that read, each named for what it does with the path in
     /// its arguments.
-    const READS: [&str; 9] = [
-        "stat", "list", "read", "head", "twice", "both", "early", "drops", "panics",
+    const READS: [&str; 10] = [
+        "stat", "list", "read", "head", "twice", "both", "early", "drops", "holds", "panics",
     ];
 
     /// The tools that change files. `rename` and `copy` take two paths
@@ -327,6 +331,15 @@ mod tests {
                 next_step().await;
                 drop(dropped);
                 call.read(path).await.map(|bytes| format!("{bytes:?}"))
+            }
+            "holds" => {
+                // The request goes to the Host, and the call then waits
+                // on something that never comes, so the step that brings
+                // the answer leaves it untaken.
+                let mut held = call.stat(path);
+                queue(&mut held).await;
+                pending::<()>().await;
+                held.await.map(|stat| format!("{stat:?}"))
             }
             _ => {
                 let mut unsent = call.read(path);
@@ -761,7 +774,8 @@ mod tests {
         }
     }
 
-    /// Polls `future` once, as a step does.
+    /// Polls `future` once, as a step does, with a waker that does
+    /// nothing, because a file future registers none.
     fn poll<T>(future: &mut (impl Future<Output = T> + Unpin)) -> Poll<T> {
         Pin::new(future).poll(&mut Context::from_waker(Waker::noop()))
     }
@@ -769,12 +783,13 @@ mod tests {
     /// What a `stat` resolves to when the Host takes its request and the
     /// next step carries `answer`.
     fn answered_with(answer: *const RvFileAnswer) -> Result<Stat, FileError> {
-        let state = CallState::new("tool", "{}");
+        let state = CallState::new("tool", "{}", "{}");
         let mut future = ToolCall::new(&state).stat("/a");
         assert_eq!(poll(&mut future), Poll::Pending);
         // SAFETY: the arguments are whole, and their functions read
         // nothing.
-        unsafe { send(&state.requests, &step_args(taking, ptr::null())) };
+        let refused = unsafe { send(&state.requests, &step_args(taking, ptr::null())) };
+        assert!(!refused, "the Host took the request");
         // SAFETY: each test passes NULL or an answer that is whole and
         // outlives this call.
         unsafe { receive(&state.requests, &step_args(taking, answer)) };
@@ -792,15 +807,78 @@ mod tests {
 
     #[test]
     fn a_request_the_host_does_not_take_fails_its_future_with_the_status() {
-        let state = CallState::new("tool", "{}");
+        let state = CallState::new("tool", "{}", "{}");
         let mut future = ToolCall::new(&state).stat("/a");
         assert_eq!(poll(&mut future), Poll::Pending);
         // SAFETY: the arguments are whole, and their functions read
         // nothing.
-        unsafe { send(&state.requests, &step_args(refusing, ptr::null())) };
+        let refused = unsafe { send(&state.requests, &step_args(refusing, ptr::null())) };
+        assert!(refused, "the step is told, so that it wakes its call");
         assert_eq!(
             poll(&mut future),
             Poll::Ready(broken("the Host answered the file function with status 4"))
+        );
+    }
+
+    /// The entry point of [`Reader`], behind a Host that takes no
+    /// `file_stat` request and lets the call go on. The Harness fails a
+    /// call whose request it does not take, so only such a Host shows
+    /// what the SDK does with a refusal.
+    unsafe extern "C" fn lax(call: *mut RvCall) -> RvStatus {
+        // SAFETY: the fake Host made `call`, with an `RvToolCallArgs`
+        // behind `args` for a step. The copy lent in its place lives
+        // until the entry point has returned, and the Host's own is put
+        // back then.
+        unsafe {
+            if (*call).verb != RV_TOOL_CALL {
+                return entry::<Reader>(call);
+            }
+            let lent = (*call).args;
+            let args = RvToolCallArgs {
+                file_stat: refusing,
+                ..lent.cast::<RvToolCallArgs>().read()
+            };
+            (*call).args = (&raw const args).cast();
+            let status = entry::<Reader>(call);
+            (*call).args = lent;
+            status
+        }
+    }
+
+    #[test]
+    fn a_request_the_host_refuses_wakes_the_call_for_the_step_that_tells_the_tool() {
+        // SAFETY: `lax` follows the contract apart from the refusal this
+        // test checks, and never unwinds.
+        let loaded = unsafe { testing::load_entry(lax) }.unwrap();
+        let pack = loaded.new_pack("acme/reader").unwrap();
+        let mut call = pack.start("stat", "/notes/a.md");
+        assert_eq!(call.step(), Ok(None));
+        // No request is with the Host, so no answer brings the next step.
+        assert!(
+            call.is_woken(),
+            "only a wake brings the step that delivers the refusal"
+        );
+        assert_eq!(
+            call.step(),
+            Ok(Some(Err(ToolError::new(
+                ToolErrorKind::Backend,
+                "Other: the Host answered the file function with status 4"
+            ))))
+        );
+    }
+
+    #[test]
+    fn an_answer_that_the_calls_future_leaves_untaken_wakes_nothing() {
+        let loaded = testing::load::<Reader>().unwrap();
+        let pack = loaded.new_pack("acme/reader").unwrap().with_files(files());
+        let mut call = pack.start("holds", "/notes/a.md");
+        assert_eq!(call.step(), Ok(None));
+        // This step brings the answer, and finds the call's future
+        // waiting on something else.
+        assert_eq!(call.step(), Ok(None));
+        assert!(
+            !call.is_woken(),
+            "the call stays parked until what it waits on wakes it"
         );
     }
 
@@ -855,7 +933,7 @@ mod tests {
 
     #[test]
     fn an_answer_to_no_request_is_left_unread() {
-        let state = CallState::new("tool", "{}");
+        let state = CallState::new("tool", "{}", "{}");
         let mut answer = bare_answer(RV_OK);
         answer.stat.len = 5;
         // SAFETY: the arguments and the answer are whole.

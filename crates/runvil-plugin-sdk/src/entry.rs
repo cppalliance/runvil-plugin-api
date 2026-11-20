@@ -44,9 +44,9 @@ use crate::{Plugin, Refusal};
 /// - `RV_PACK_DELETE` by dropping that instance;
 /// - `RV_TOOL_CALL` by polling the future of
 ///   [`Pack::call`](crate::Pack::call) once, with the answer to its file
-///   request at hand, and then ending the call with its result when the
-///   future is ready, or else handing the Host the call's next file
-///   request;
+///   request at hand and a waker over the Host's waker for the call, and
+///   then ending the call with its result when the future is ready, or
+///   else handing the Host the call's next file request;
 /// - `RV_TOOL_CANCEL` by dropping that future;
 /// - any other verb with `RV_ERR_UNSUPPORTED`.
 ///

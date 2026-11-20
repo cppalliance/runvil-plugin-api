@@ -67,12 +67,25 @@ pub trait Pack: Send + Sync + 'static {
     /// Performs one call of the tool `call` names.
     ///
     /// The Host runs the returned future one step at a time: each step
-    /// polls it once, and a `Pending` ends the step. The Host then sends
-    /// the next step without being woken, so the future never waits on a
-    /// waker; a long job awaits [`next_step`](crate::next_step) every so
-    /// often instead. A step that works for long, or blocks, stalls its
-    /// run, and the Host can abandon a call only between steps, which
-    /// drops the future.
+    /// polls it once, and a `Pending` ends the step and parks the call.
+    /// The Host sends the next step when the future's waker is woken, so
+    /// the future may wait on a waker like any Rust future: on a timer, a
+    /// channel, or a task on a runtime the Plugin owns, each of which
+    /// wakes it from a thread of the Plugin. A future that returns
+    /// `Pending` without arranging a wake, and without a file request,
+    /// parks for good.
+    ///
+    /// A step that works for long, or blocks, stalls its run, and the
+    /// Host can abandon a call only between steps, which drops the
+    /// future. So a long job awaits [`next_step`](crate::next_step) every
+    /// so often, and a call that waits on something outside its run
+    /// awaits it and blocks no step for it.
+    ///
+    /// The future may hand its waker to a thread of the Plugin, which may
+    /// hold it past the call's end, because the Host keeps the waker
+    /// valid until the Plugin is unloaded: a wake that comes late does
+    /// nothing for the call. Dropping the Plugin instance stops every
+    /// thread that holds one, as it stops every thread of the Plugin.
     ///
     /// The future reaches the run's files through the file methods of
     /// `call`. Awaiting one ends the step with a request to the Host, and
@@ -80,7 +93,9 @@ pub trait Pack: Send + Sync + 'static {
     /// comes only with a step, so a file method is awaited inside the
     /// returned future. This function returns before that future is first
     /// polled, so it can make the future of a file method and cannot have
-    /// its answer.
+    /// its answer. A file future gets its answer only when a step polls
+    /// it, so it does not work inside a set that polls a child only after
+    /// that child's waker fired, such as `FuturesUnordered`.
     ///
     /// A panic in the future ends the call as a failure and never unwinds
     /// into the Host.

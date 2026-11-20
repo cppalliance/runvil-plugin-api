@@ -74,8 +74,10 @@ impl ToolInfo {
 }
 
 /// What one tool call lends its [`Pack`](crate::Pack): the tool's name,
-/// the call's arguments, and the files of the call's run. It borrows from
-/// the call, so a Pack cannot keep it past the call's end.
+/// the call's arguments, the Host's resources, and the files of the
+/// call's run. It borrows from the call, so a Pack cannot keep it past
+/// the call's end. Its `Debug` prints none of the resources, because
+/// they can hold a key.
 ///
 /// The file methods ask the Host, so the run's policy applies to every
 /// operation, and one the policy denies fails like any other. Each
@@ -118,6 +120,16 @@ impl<'a> ToolCall<'a> {
     #[must_use]
     pub fn arguments(&self) -> &'a str {
         &self.state.arguments
+    }
+
+    /// The Host's resources as they were when the call started: the JSON
+    /// text of an object keyed by resource name, `{}` when there are none.
+    /// The Plugin parses it with a JSON library of its own. The text can
+    /// hold a key, so none of it belongs in an output or a failure, which
+    /// a model reads.
+    #[must_use]
+    pub fn resources(&self) -> &'a str {
+        self.state.resources.text()
     }
 
     /// What `path` names. A link is reported as a link, not as what it
@@ -247,25 +259,51 @@ impl<'a> ToolCall<'a> {
     }
 }
 
+/// The Host's resources text. Its `Debug` prints none of it, because the
+/// text can hold a key.
+pub(crate) struct Resources(String);
+
+impl Resources {
+    /// The resources `text` holds, as the Host sent them.
+    pub(crate) fn new(text: impl Into<String>) -> Resources {
+        Resources(text.into())
+    }
+
+    /// The text, as the Host sent it.
+    pub(crate) fn text(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for Resources {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Resources").finish_non_exhaustive()
+    }
+}
+
 /// What one tool call keeps for all of its steps: the copies of its tool
-/// name and arguments that a [`ToolCall`] reads, and the file requests
-/// its file methods make.
+/// name, its arguments, and the Host's resources that a [`ToolCall`]
+/// reads, and the file requests its file methods make. The Host lends
+/// the three texts for one step only, so the call's first step copies
+/// them here.
 #[derive(Debug)]
 pub(crate) struct CallState {
     pub(crate) tool: String,
     pub(crate) arguments: String,
+    pub(crate) resources: Resources,
     /// The call's file requests: its futures queue them, and its steps
     /// take them to the Host and bring the answers back.
     pub(crate) requests: Requests,
 }
 
 impl CallState {
-    /// The state of a call of `tool` with `arguments`, which has asked
-    /// for no file.
-    pub(crate) fn new(tool: &str, arguments: &str) -> CallState {
+    /// The state of a call of `tool` with `arguments`, lent `resources`,
+    /// which has asked for no file.
+    pub(crate) fn new(tool: &str, arguments: &str, resources: &str) -> CallState {
         CallState {
             tool: tool.to_owned(),
             arguments: arguments.to_owned(),
+            resources: Resources::new(resources),
             requests: Requests::default(),
         }
     }
@@ -368,7 +406,8 @@ impl fmt::Display for ToolError {
 
 impl std::error::Error for ToolError {}
 
-/// Ends the current step of a tool call and goes on at the next one.
+/// Ends the current step of a tool call and goes on at the next one,
+/// which the Host sends right away.
 ///
 /// A [`Pack::call`](crate::Pack::call) future that does a long job awaits
 /// this every so often, so that no step works for long and the Host can
@@ -390,11 +429,14 @@ pub struct NextStep {
 impl Future for NextStep {
     type Output = ();
 
-    fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<()> {
+    /// The one `Pending` wakes the task first, because a call that is not
+    /// woken gets no next step.
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
         if self.ended {
             return Poll::Ready(());
         }
         self.ended = true;
+        cx.waker().wake_by_ref();
         Poll::Pending
     }
 }
@@ -403,11 +445,26 @@ impl Future for NextStep {
 mod tests {
     use std::future::Future;
     use std::pin::{Pin, pin};
-    use std::task::{Context, Poll, Waker};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll, Wake, Waker};
 
     use super::{CallState, ToolCall, ToolError, ToolErrorKind, ToolInfo, ToolOutput, next_step};
     use crate::file::Request;
     use crate::{FileError, FileErrorKind};
+
+    /// Resources that hold a key, which no `Debug` may print.
+    const RESOURCES: &str = r#"{"acme/search":{"api_key":"hunter2"}}"#;
+
+    /// Counts the wakes of the waker made over it.
+    #[derive(Default)]
+    struct Wakes(AtomicUsize);
+
+    impl Wake for Wakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
 
     #[test]
     fn a_tool_info_keeps_what_it_was_built_from_and_has_no_wire_name_until_one_is_set() {
@@ -427,11 +484,27 @@ mod tests {
     }
 
     #[test]
-    fn a_tool_call_lends_the_tool_name_and_the_arguments() {
-        let state = CallState::new("fetch", r#"{"url":"x"}"#);
+    fn a_tool_call_lends_the_tool_name_the_arguments_and_the_resources() {
+        let state = CallState::new("fetch", r#"{"url":"x"}"#, RESOURCES);
         let call = ToolCall::new(&state);
         assert_eq!(call.tool(), "fetch");
         assert_eq!(call.arguments(), r#"{"url":"x"}"#);
+        assert_eq!(call.resources(), RESOURCES);
+    }
+
+    #[test]
+    fn the_debug_text_of_a_call_and_of_its_state_holds_none_of_the_resources() {
+        let state = CallState::new("fetch", "{}", RESOURCES);
+        let call = ToolCall::new(&state);
+        for shown in [
+            format!("{:?}", state.resources),
+            format!("{state:?}"),
+            format!("{call:?}"),
+        ] {
+            assert!(shown.contains("Resources { .. }"), "{shown}");
+            assert!(!shown.contains("hunter2"), "{shown}");
+            assert!(!shown.contains("acme/search"), "{shown}");
+        }
     }
 
     /// Polls `future` once and returns the request the call's next send
@@ -453,7 +526,7 @@ mod tests {
 
     #[test]
     fn each_file_method_asks_for_what_it_was_called_with() {
-        let state = CallState::new("fetch", "{}");
+        let state = CallState::new("fetch", "{}", "{}");
         let call = ToolCall::new(&state);
         assert_eq!(
             asked(&state, call.stat("/a")),
@@ -480,7 +553,7 @@ mod tests {
 
     #[test]
     fn each_method_that_changes_files_asks_for_what_it_was_called_with() {
-        let state = CallState::new("save", "{}");
+        let state = CallState::new("save", "{}", "{}");
         let call = ToolCall::new(&state);
         let (path, from, to) = ("/a".to_owned(), "/a".to_owned(), "/b".to_owned());
         assert_eq!(
@@ -526,7 +599,7 @@ mod tests {
 
     #[test]
     fn a_file_method_copies_its_path_when_its_future_is_made() {
-        let state = CallState::new("fetch", "{}");
+        let state = CallState::new("fetch", "{}", "{}");
         let call = ToolCall::new(&state);
         let future = {
             let path = String::from("/gone/before/the/poll");
@@ -562,10 +635,18 @@ mod tests {
     }
 
     #[test]
-    fn next_step_is_pending_for_one_poll_and_then_ready() {
+    fn next_step_wakes_its_task_at_its_one_pending_and_is_then_ready() {
+        let count = Arc::new(Wakes::default());
+        let waker = Waker::from(Arc::clone(&count));
+        let mut cx = Context::from_waker(&waker);
         let mut step = pin!(next_step());
-        let mut cx = Context::from_waker(Waker::noop());
         assert_eq!(step.as_mut().poll(&mut cx), Poll::Pending);
+        assert_eq!(
+            count.0.load(Ordering::SeqCst),
+            1,
+            "a call that is not woken gets no next step"
+        );
         assert_eq!(step.as_mut().poll(&mut cx), Poll::Ready(()));
+        assert_eq!(count.0.load(Ordering::SeqCst), 1, "the one wake");
     }
 }

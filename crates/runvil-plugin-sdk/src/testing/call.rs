@@ -50,7 +50,7 @@ pub(super) unsafe extern "C" fn finish(ctx: *mut c_void, result: *const RvToolRe
 }
 
 /// What the Harness makes of a step that returned `status`: `None` for a
-/// call that needs another step, its result once it ended, or why the
+/// call that the step parked, its result once it ended, or why the
 /// call failed, checked in the Harness's order: a misuse, then a result
 /// beside `RV_PENDING`, then a status other than `RV_OK`, then no result.
 pub(super) fn judge(
@@ -74,11 +74,14 @@ pub(super) fn judge(
 #[cfg(test)]
 mod tests {
     //! The rules of a tool call's steps, through a raw entry point that
-    //! breaks one of them at a time.
+    //! breaks one of them at a time, and when a call is due its next
+    //! step.
+
+    use std::time::Duration;
 
     use runvil_plugin_sys::RV_ERR_UNSUPPORTED;
 
-    use crate::testing::fixture::{self, ANSWERS, Breach, CANCELS};
+    use crate::testing::fixture::{self, ANSWERS, Breach, CANCELS, LENT, WAKER};
     use crate::testing::{Failure, Files};
     use crate::{ToolError, ToolErrorKind, ToolOutput};
 
@@ -235,6 +238,135 @@ mod tests {
             );
             CANCELS.set(0);
         }
+    }
+
+    #[test]
+    fn a_step_that_wakes_its_call_makes_the_next_step_due_at_once() {
+        let loaded = fixture::load(Breach::None).unwrap();
+        let pack = loaded.new_pack("acme/fixture").unwrap();
+        let mut call = pack.start("other", "{}");
+        assert_eq!(call.step(), Ok(None));
+        assert!(call.is_woken(), "the step woke its call on this thread");
+        call.wait();
+    }
+
+    #[test]
+    fn a_parked_call_is_due_one_step_for_the_wakes_since_its_last_step_began() {
+        let loaded = fixture::load(Breach::None).unwrap();
+        let pack = loaded.new_pack("acme/fixture").unwrap();
+        let mut call = pack.start("parks", "{}");
+        assert_eq!(call.step(), Ok(None));
+        assert!(!call.is_woken(), "the step woke nothing");
+        fixture::wake_kept();
+        fixture::wake_kept();
+        call.wait();
+        // The step the wakes asked for answers both, and wakes nothing.
+        assert_eq!(call.step(), Ok(None));
+        assert!(!call.is_woken(), "wakes do not add up");
+        fixture::wake_kept();
+        call.wait();
+        assert_eq!(
+            call.step(),
+            Ok(Some(Ok(ToolOutput::untrusted("parks after 2 steps"))))
+        );
+    }
+
+    #[test]
+    fn a_call_is_due_a_step_without_a_wake_at_its_start_and_after_a_file_request() {
+        let loaded = fixture::load(Breach::None).unwrap();
+        let files = Files::new().file("/notes/a.md", "hello");
+        let pack = loaded.new_pack("acme/fixture").unwrap().with_files(files);
+        let mut call = pack.start("asks", "/notes/a.md");
+        call.wait();
+        assert_eq!(call.step(), Ok(None));
+        assert!(!call.is_woken(), "the step made a request and woke nothing");
+        call.wait();
+        assert_eq!(call.step(), Ok(Some(Ok(ToolOutput::untrusted("hello")))));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "the call of the tool parks was not woken within 10ms: its last step returned RV_PENDING with no file request, so its next step is due only after the Plugin wakes the call"
+    )]
+    fn a_parked_call_that_nothing_wakes_fails_its_wait_with_a_sentence() {
+        let loaded = fixture::load(Breach::None).unwrap();
+        let pack = loaded.new_pack("acme/fixture").unwrap();
+        let mut call = pack.start("parks", "{}");
+        assert_eq!(call.step(), Ok(None));
+        call.wait_for(Duration::from_millis(10));
+    }
+
+    #[test]
+    #[should_panic(expected = "the call has ended and waits for no step")]
+    fn waiting_for_a_call_that_ended_is_the_tests_own_fault() {
+        let loaded = fixture::load(Breach::None).unwrap();
+        let pack = loaded.new_pack("acme/fixture").unwrap();
+        let mut call = pack.start("tool", "{}");
+        let _result = call.step();
+        call.wait();
+    }
+
+    #[test]
+    fn a_wake_inside_a_cancel_is_noted_and_blocks_nothing() {
+        let loaded = fixture::load(Breach::None).unwrap();
+        let pack = loaded.new_pack("acme/fixture").unwrap();
+        let mut call = pack.start("parks", "{}");
+        assert_eq!(call.step(), Ok(None));
+        assert!(!call.is_woken());
+        // The fixture wakes the call inside `RV_TOOL_CANCEL`, on this
+        // thread, as a destructor of a Plugin does.
+        drop(call);
+        assert_eq!(CANCELS.get(), 1);
+        let wakers = loaded.wakers.borrow();
+        assert!(wakers[0].wait(Duration::ZERO), "the wake was noted");
+    }
+
+    #[test]
+    fn a_wake_after_its_call_ended_reaches_live_memory_and_no_other_call() {
+        let loaded = fixture::load(Breach::None).unwrap();
+        let pack = loaded.new_pack("acme/fixture").unwrap();
+        assert_eq!(
+            pack.call("other", "{}"),
+            Ok(Ok(ToolOutput::untrusted("other after 2 steps")))
+        );
+        let late = WAKER.get().expect("the fixture kept the call's waker");
+        let mut parked = pack.start("parks", "{}");
+        assert_eq!(parked.step(), Ok(None));
+        // SAFETY: the fake Host keeps the waker of a call that ended
+        // valid until the Plugin is unloaded.
+        unsafe { (late.wake)(late.ctx) };
+        assert!(!parked.is_woken(), "the late wake is not this call's");
+        drop(parked);
+        drop(pack);
+        // SAFETY: as above; the Pack instance is deleted, and the Plugin
+        // is still loaded.
+        unsafe { (late.wake)(late.ctx) };
+        let wakers = loaded.wakers.borrow();
+        assert_eq!(wakers.len(), 2, "each call's waker is kept");
+        assert!(
+            wakers[0].wait(Duration::ZERO),
+            "the late wake reached what its own call's waker points at"
+        );
+    }
+
+    #[test]
+    fn every_step_of_a_call_is_lent_the_same_resources_and_the_same_waker() {
+        let loaded = fixture::load(Breach::None).unwrap();
+        let pack = loaded.new_pack("acme/fixture").unwrap();
+        assert!(pack.call("tool", "{}").is_ok());
+        let by_default = LENT.take();
+        assert_eq!(by_default.len(), 1);
+        assert_eq!(by_default[0].0, "{}");
+
+        let pack = pack.with_resources(r#"{"acme/key":1}"#);
+        assert!(pack.call("other", "{}").is_ok());
+        let lent = LENT.take();
+        assert_eq!(lent.len(), 3, "one for each step");
+        for (resources, waker) in &lent {
+            assert_eq!(resources, r#"{"acme/key":1}"#);
+            assert_eq!(*waker, lent[0].1);
+        }
+        assert_ne!(lent[0].1, by_default[0].1, "each call has its own waker");
     }
 
     #[test]

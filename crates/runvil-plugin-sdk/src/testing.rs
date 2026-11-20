@@ -30,6 +30,21 @@
 //! the change of a call that is dropped between those two steps has
 //! happened.
 //!
+//! A step that returns `RV_PENDING` parks its call, as it does in the
+//! Harness. [`PackRun::call`] sends the next step once the Plugin has
+//! woken the call, or at once when the step made a file request, and
+//! [`Call::wait`] is that wait for a test that sends each step itself. A
+//! call that nothing wakes fails its test after 60 seconds, with a
+//! sentence that says so, and does not hang it.
+//!
+//! Every call is lent the Host's resources, the JSON text of an object.
+//! It is `{}` unless [`PackRun::with_resources`] gives the run another:
+//!
+//! ```text
+//! let resources = r#"{"acme/search":{"url":"http://127.0.0.1:9/search"}}"#;
+//! let pack = loaded.new_pack("acme/url").unwrap().with_resources(resources);
+//! ```
+//!
 //! A Plugin crate enables it from `[dev-dependencies]` only:
 //!
 //! ```text
@@ -46,23 +61,33 @@ mod load;
 mod pack;
 mod session;
 mod tree;
+mod wake;
 
+use std::cell::RefCell;
 use std::ffi::c_void;
+use std::sync::Arc;
+use std::time::Duration;
 use std::{mem, ptr};
 
 use runvil_plugin_sys::{
     PluginEntry, RV_API_MAJOR, RV_API_MINOR, RV_OK, RV_PACK_DELETE, RV_PACK_NEW, RV_PENDING,
     RV_PLUGIN_LOAD, RV_PLUGIN_UNLOAD, RV_TOOL_CALL, RV_TOOL_CANCEL, RvCall, RvHost, RvLoadArgs,
-    RvPackNewArgs, RvStatus, RvToolCallArgs, RvWaker,
+    RvPackNewArgs, RvStatus, RvToolCallArgs,
 };
 
 use self::session::{Described, Session, Verb};
 pub use self::tree::Files;
+use self::wake::WakerCell;
 use crate::entry::{rv_str, size_field};
+use crate::tool::Resources;
 use crate::{Plugin, ToolError, ToolInfo, ToolOutput, entry};
 
 /// How a tool call ended: its output, or its failure.
 pub type ToolResult = Result<ToolOutput, ToolError>;
+
+/// How long [`Call::wait`] waits for a wake. A wake that is coming comes
+/// far sooner in a test, so one that has not come by then is missing.
+const WAIT_LIMIT: Duration = Duration::from_secs(60);
 
 /// Loads the Plugin `P` through [`entry::<P>`](entry), as the Harness
 /// loads a Plugin a Host hands it.
@@ -111,6 +136,7 @@ pub unsafe fn load_entry(entry: PluginEntry) -> Result<Loaded, Failure> {
         version,
         packs: mem::take(&mut session.packs),
         _session: session,
+        wakers: RefCell::new(Vec::new()),
         unloaded: false,
     })
 }
@@ -127,6 +153,11 @@ pub struct Loaded {
     /// What the load's `ctx` points at, kept until the Plugin is unloaded,
     /// as the contract requires of a Host.
     _session: Box<Session>,
+    /// What the waker of each tool call so far points at, kept until the
+    /// Plugin is unloaded, as the contract requires of a Host. So a wake
+    /// that comes after its call ended, from any thread, reaches live
+    /// memory.
+    wakers: RefCell<Vec<Arc<WakerCell>>>,
     unloaded: bool,
 }
 
@@ -188,7 +219,16 @@ impl Loaded {
             instance: call.pack_run,
             tools: mem::take(&mut session.tools),
             files: Files::new(),
+            resources: Resources::new("{}"),
         })
+    }
+
+    /// What the waker of one more tool call points at. This value keeps
+    /// it until the Plugin is unloaded, however soon the call ends.
+    fn new_waker(&self) -> Arc<WakerCell> {
+        let cell = Arc::new(WakerCell::default());
+        self.wakers.borrow_mut().push(Arc::clone(&cell));
+        cell
     }
 
     /// Sends `RV_PLUGIN_UNLOAD` and returns the Plugin's status, which the
@@ -241,6 +281,8 @@ pub struct PackRun<'a> {
     /// The run's files, which the file requests of each call are
     /// performed on.
     files: Files,
+    /// The Host's resources, which every step of each call is lent.
+    resources: Resources,
 }
 
 impl PackRun<'_> {
@@ -267,9 +309,21 @@ impl PackRun<'_> {
         &self.files
     }
 
+    /// The instance with `json` as the Host's resources for every call
+    /// made from here on, in place of `{}`. A Host sends the JSON text of
+    /// an object keyed by resource name, and each step of a call is lent
+    /// the text as it is here.
+    #[must_use]
+    pub fn with_resources(mut self, json: impl Into<String>) -> Self {
+        self.resources = Resources::new(json);
+        self
+    }
+
     /// Runs one call of `tool` with `arguments`, the JSON text of its
-    /// arguments, to its end: sends `RV_TOOL_CALL` until a step stops
-    /// returning `RV_PENDING`. Returns the tool's own result.
+    /// arguments, to its end, as the Harness does: sends a step with
+    /// [`Call::step`], and after each one that returns `RV_PENDING`
+    /// waits with [`Call::wait`] until the call is due its next step.
+    /// Returns the tool's own result.
     ///
     /// # Errors
     /// Returns the [`Failure`] the Harness would report for a call that
@@ -277,13 +331,15 @@ impl PackRun<'_> {
     ///
     /// # Panics
     /// Panics when the instance added no tool named `tool`, which the
-    /// Harness never calls.
+    /// Harness never calls, and when a step parks the call and the Plugin
+    /// does not wake it within 60 seconds; see [`Call::wait`].
     pub fn call(&self, tool: &str, arguments: &str) -> Result<ToolResult, Failure> {
         let mut call = self.start(tool, arguments);
         loop {
             if let Some(result) = call.step()? {
                 return Ok(result);
             }
+            call.wait();
         }
     }
 
@@ -308,6 +364,7 @@ impl PackRun<'_> {
             pending: false,
             ended: false,
             answer: None,
+            waker: self.loaded.new_waker(),
         }
     }
 
@@ -347,16 +404,28 @@ pub struct Call<'a> {
     /// The answer to the file request the last step made, which the next
     /// step is lent.
     answer: Option<file::Answer>,
+    /// What the call's waker points at: whether the Plugin has woken the
+    /// call since its last step began. The [`Loaded`] Plugin keeps it
+    /// too, until the Plugin is unloaded.
+    waker: Arc<WakerCell>,
 }
 
 impl Call<'_> {
     /// Sends one `RV_TOOL_CALL`. Returns `None` when the step returned
-    /// `RV_PENDING`, so the call needs another step, and the tool's own
-    /// result once the call ended.
+    /// `RV_PENDING`, which parks the call, and the tool's own result once
+    /// the call ended. [`Call::wait`] blocks until a parked call is due
+    /// its next step. This sends a step whether or not one is due,
+    /// because the contract lets a Host send a step that no wake asked
+    /// for.
     ///
     /// A file request the step made is performed on the run's [`Files`]
     /// before this returns, and the call's next step is lent the answer.
     /// A call that is dropped before that step leaves the operation done.
+    ///
+    /// The step is lent the run's resources and the call's waker, the
+    /// same one at every step. A wake that came before the step is
+    /// answered by it, and a wake from its beginning on asks for the step
+    /// after it.
     ///
     /// # Errors
     /// Returns the [`Failure`] the Harness would report, checked in the
@@ -377,6 +446,10 @@ impl Call<'_> {
         // function returns, which is after the step has.
         let answer = self.answer.take();
         let lent = answer.as_ref().map(file::Answer::raw);
+        // This step answers every wake so far. The cell's lock is let go
+        // before the Plugin runs, because a Plugin may wake the call on
+        // this thread during the step.
+        self.waker.clear();
         let (status, mut session) = session::open(Verb::ToolCall, |ctx| {
             let args = RvToolCallArgs {
                 size: size_field::<RvToolCallArgs>(),
@@ -395,11 +468,8 @@ impl Call<'_> {
                 file_remove: file::file_remove,
                 file_rename: file::file_rename,
                 file_copy: file::file_copy,
-                resources: rv_str("{}"),
-                waker: RvWaker {
-                    ctx: ptr::null_mut(),
-                    wake,
-                },
+                resources: rv_str(self.pack.resources.text()),
+                waker: WakerCell::waker(&self.waker),
             };
             call.args = (&raw const args).cast();
             // SAFETY: `load_entry`'s caller guaranteed `entry` follows the
@@ -419,8 +489,57 @@ impl Call<'_> {
         outcome
     }
 
+    /// Blocks until the call is due its next step, as the Harness waits
+    /// before it sends one. It returns at once in three cases:
+    ///
+    /// - No step was sent yet. A call's first step is due as soon as the
+    ///   call starts, as [`Call::step`] sends it without a wake.
+    /// - The last step made a file request. The fake Host has performed
+    ///   it, so the answer is ready.
+    /// - The Plugin has woken the call since its last step began.
+    ///
+    /// Otherwise the call is parked, and this blocks until the Plugin
+    /// wakes it, from any thread.
+    ///
+    /// # Panics
+    /// Panics when the call has ended, which is due no step, as
+    /// [`Call::step`] panics for such a call. Panics when the call is
+    /// parked and no wake comes within 60 seconds, with a sentence that
+    /// says so, so a call that is never woken fails its test and does not
+    /// hang it.
+    pub fn wait(&self) {
+        self.wait_for(WAIT_LIMIT);
+    }
+
+    /// [`Call::wait`], with `limit` as the time a wake may take.
+    fn wait_for(&self, limit: Duration) {
+        assert!(!self.ended, "the call has ended and waits for no step");
+        // A call that has not ended and is not pending was sent no step
+        // yet, and an answer is here only after a step made a request.
+        if !self.pending || self.answer.is_some() {
+            return;
+        }
+        assert!(
+            self.waker.wait(limit),
+            "the call of the tool {} was not woken within {limit:?}: its last step returned \
+             RV_PENDING with no file request, so its next step is due only after the Plugin \
+             wakes the call",
+            self.tool
+        );
+    }
+
+    /// Whether the Plugin has woken the call since its last step began,
+    /// for this crate's own tests, which check a wake without waiting
+    /// for one.
+    #[cfg(test)]
+    pub(crate) fn is_woken(&self) -> bool {
+        self.waker.wait(Duration::ZERO)
+    }
+
     /// Ends the call: sends `RV_TOOL_CANCEL` when its last step returned
-    /// `RV_PENDING`, so the Plugin frees the call's state.
+    /// `RV_PENDING`, so the Plugin frees the call's state. No lock is held
+    /// meanwhile, because a Plugin may wake the call as it frees that
+    /// state.
     fn end(&mut self) {
         self.ended = true;
         if !mem::take(&mut self.pending) {
@@ -457,11 +576,6 @@ pub enum Failure {
     /// `RV_TOOL_CALL` returned `RV_OK` without finishing the call.
     Unfinished,
 }
-
-/// The `wake` of the waker every step is handed. It notes nothing: this
-/// fake Host sends a pending call its next step without waiting for a
-/// wake, which the contract allows.
-unsafe extern "C" fn wake(_ctx: *mut c_void) {}
 
 /// The `RvHost` every call hands the Plugin.
 static HOST: RvHost = RvHost {

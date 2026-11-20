@@ -397,16 +397,21 @@ impl Requests {
     /// `hand_over` returns `Ok`, and otherwise the error is the answer its
     /// future gets.
     ///
+    /// Returns whether `hand_over` refused the request. Its answer is
+    /// then here already, with no future polled since to take it and no
+    /// request at the Host whose answer would bring the call's next
+    /// step, so the caller wakes the call.
+    ///
     /// The lock is held while `hand_over` runs. It calls a file function
     /// of the Host, which only takes the request and so reaches nothing
     /// here.
-    pub(crate) fn send(&self, hand_over: impl FnOnce(&Request) -> Result<(), FileError>) {
+    pub(crate) fn send(&self, hand_over: impl FnOnce(&Request) -> Result<(), FileError>) -> bool {
         let mut queue = self.lock();
         if queue.sent.is_some() {
-            return;
+            return false;
         }
         let Some((number, request)) = queue.waiting.pop_front() else {
-            return;
+            return false;
         };
         match hand_over(&request) {
             Ok(()) => {
@@ -414,8 +419,12 @@ impl Requests {
                     number,
                     awaited: true,
                 });
+                false
             }
-            Err(error) => queue.answers.push((number, Err(error))),
+            Err(error) => {
+                queue.answers.push((number, Err(error)));
+                true
+            }
         }
     }
 }
@@ -431,6 +440,13 @@ impl Requests {
 /// first polled, and go out one with each step. The answer arrives with
 /// the step after the request went out, and the future is ready when
 /// that step, or a later one, polls it.
+///
+/// The future gets its answer only when a step polls it: it registers no
+/// waker, because the step that brings the answer polls the call's
+/// future. So it does not work inside a set that polls a child only
+/// after that child's waker fired, such as `FuturesUnordered`. A future
+/// that awaits it directly, or through a combinator that polls every
+/// child at each poll, such as `join!` or `select!`, gets the answer.
 ///
 /// A future that is dropped before its request went to the Host sends
 /// nothing. One that is dropped later leaves the operation to happen, and
@@ -484,8 +500,9 @@ impl<'a, T> FileFuture<'a, T> {
 impl<T> Future for FileFuture<'_, T> {
     type Output = Result<T, FileError>;
 
-    /// Nothing wakes the task: the Host sends the step that brings the
-    /// answer on its own.
+    /// The future registers no waker. The Host sends the step that
+    /// brings the answer when the answer is ready, without a wake, and
+    /// that step polls the call's future.
     fn poll(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Self::Output> {
         match mem::replace(&mut self.stage, Stage::Done) {
             Stage::Made(request) => {
@@ -535,7 +552,8 @@ mod tests {
         Answer, DirEntry, FileError, FileErrorKind, FileFuture, FileType, Request, Requests, Stat,
     };
 
-    /// Polls `future` once, as a step does.
+    /// Polls `future` once, as a step does, with a waker that does
+    /// nothing, because a file future registers none.
     fn poll<T>(future: &mut FileFuture<'_, T>) -> Poll<Result<T, FileError>> {
         Pin::new(future).poll(&mut Context::from_waker(Waker::noop()))
     }
@@ -694,10 +712,30 @@ mod tests {
         assert_eq!(poll(&mut refused), Poll::Pending);
         assert_eq!(poll(&mut next), Poll::Pending);
         let fault = FileError::new(FileErrorKind::Other, "status 4");
-        requests.send(|_| Err(fault.clone()));
+        assert!(requests.send(|_| Err(fault.clone())));
         assert!(!requests.is_sent());
         assert_eq!(poll(&mut refused), Poll::Ready(Err(fault)));
         assert_eq!(sent(&requests), Some(Request::Stat("/b".to_owned())));
+    }
+
+    #[test]
+    fn a_send_reports_a_refusal_and_nothing_else() {
+        let requests = Requests::default();
+        let refuse = |_: &Request| Err(FileError::new(FileErrorKind::Other, "status 4"));
+        assert!(!requests.send(refuse), "no request waits");
+        let mut first = stat(&requests, "/a");
+        let mut second = stat(&requests, "/b");
+        assert_eq!(poll(&mut first), Poll::Pending);
+        assert_eq!(poll(&mut second), Poll::Pending);
+        assert!(!requests.send(|_| Ok(())), "the Host took the request");
+        assert!(!requests.send(refuse), "one request is with the Host");
+        // The step that brings an answer polls the call's future, so an
+        // answer that future leaves untaken is no reason to wake.
+        requests.answered(Ok(file_of(1)));
+        assert!(!requests.send(|_| Ok(())), "the Host took the next request");
+        requests.answered(Ok(file_of(2)));
+        assert_eq!(untaken(&requests), 2);
+        assert!(!requests.send(refuse), "no request waits");
     }
 
     #[test]

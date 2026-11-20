@@ -3,15 +3,15 @@
 //! It ignores what the Host's functions answer and returns `RV_OK`, as a
 //! careless Plugin would, so each test sees what the fake Host recorded.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::ffi::c_void;
 use std::ptr;
 
 use runvil_plugin_sys::{
     RV_ERR_UNSUPPORTED, RV_OK, RV_PACK_DELETE, RV_PACK_NEW, RV_PENDING, RV_PLUGIN_LOAD,
-    RV_RESULT_UNTRUSTED, RV_TOOL_CALL, RV_TOOL_CANCEL, RV_TOOL_CHANGES_FILES, RvCall, RvLoadArgs,
-    RvPackInfo, RvPackNewArgs, RvPluginInfo, RvStatus, RvStr, RvToolCallArgs, RvToolInfo,
-    RvToolResult,
+    RV_PLUGIN_UNLOAD, RV_RESULT_UNTRUSTED, RV_TOOL_CALL, RV_TOOL_CANCEL, RV_TOOL_CHANGES_FILES,
+    RvCall, RvLoadArgs, RvPackInfo, RvPackNewArgs, RvPluginInfo, RvStatus, RvStr, RvToolCallArgs,
+    RvToolInfo, RvToolResult, RvWaker,
 };
 
 use super::{Failure, Loaded, load_entry};
@@ -26,6 +26,12 @@ thread_local! {
     pub(super) static CANCELS: Cell<usize> = const { Cell::new(0) };
     /// How many steps the fixture on this thread got with an answer.
     pub(super) static ANSWERS: Cell<usize> = const { Cell::new(0) };
+    /// The waker of the last step the fixture on this thread got, until
+    /// the fixture is unloaded. A test wakes a call through it.
+    pub(super) static WAKER: Cell<Option<RvWaker>> = const { Cell::new(None) };
+    /// What each step the fixture on this thread got was lent: the
+    /// resources, and the address of the waker's `ctx`.
+    pub(super) static LENT: RefCell<Vec<(String, usize)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// The one rule the fixture breaks.
@@ -114,12 +120,32 @@ unsafe extern "C" fn entry(call: *mut RvCall) -> RvStatus {
     unsafe {
         match (*call).verb {
             RV_PLUGIN_LOAD => load_verb(call, &*(*call).args.cast(), breach),
+            RV_PLUGIN_UNLOAD => {
+                // No waker is valid once the unload returns.
+                WAKER.set(None);
+                RV_OK
+            }
             RV_PACK_NEW => pack_new(call, &*(*call).args.cast(), breach),
             RV_PACK_DELETE => count(&DELETES),
             RV_TOOL_CALL => tool_call(call, &*(*call).args.cast(), breach),
-            RV_TOOL_CANCEL => count(&CANCELS),
+            RV_TOOL_CANCEL => {
+                // A Plugin may wake a call while it frees the call's
+                // state, as a destructor does.
+                wake_kept();
+                count(&CANCELS)
+            }
             _ => RV_OK,
         }
+    }
+}
+
+/// Wakes through the waker of the last step the fixture on this thread
+/// got, when it got one.
+pub(super) fn wake_kept() {
+    if let Some(waker) = WAKER.get() {
+        // SAFETY: the fake Host keeps every waker valid until the fixture
+        // is unloaded, which forgets this one.
+        unsafe { (waker.wake)(waker.ctx) };
     }
 }
 
@@ -238,6 +264,12 @@ unsafe fn pack_new(call: *mut RvCall, args: &RvPackNewArgs, breach: Breach) -> R
         description: rv_str("A fixture tool that reads a file."),
         ..tool_info(Breach::None)
     };
+    let parks = RvToolInfo {
+        name: rv_str("parks"),
+        wire_name: rv_str(""),
+        description: rv_str("A fixture tool that wakes nothing."),
+        ..tool_info(Breach::None)
+    };
     // SAFETY: the open call's own functions, and structs that outlive each
     // call.
     unsafe {
@@ -256,16 +288,23 @@ unsafe fn pack_new(call: *mut RvCall, args: &RvPackNewArgs, breach: Breach) -> R
         }
         (args.add_tool)(ctx, &raw const other);
         (args.add_tool)(ctx, &raw const asks);
+        (args.add_tool)(ctx, &raw const parks);
         (*call).pack_run = dangling();
     }
     RV_OK
 }
 
-/// Answers `RV_TOOL_CALL`. The tool `other` returns `RV_PENDING` twice
-/// before it finishes, counting its steps in `call->tool_call`. The tool
-/// `asks` reads the file its arguments name, in two steps. The tool
-/// `tool` finishes at once, with the kind its arguments spell, and its
-/// name and arguments as the text.
+/// Answers `RV_TOOL_CALL`, keeps the step's waker in [`WAKER`], and notes
+/// in [`LENT`] what the step was lent.
+///
+/// The tool `other` returns `RV_PENDING` twice before it finishes,
+/// counting its steps in `call->tool_call`, and wakes its call before
+/// each `RV_PENDING`, because no file request brings its next step. The
+/// tool `parks` does the same and wakes nothing, so its call is due a
+/// next step only once a test has woken it. The tool `asks` reads the
+/// file its arguments name, in two steps. The tool `tool` finishes at
+/// once, with the kind its arguments spell, and its name and arguments
+/// as the text.
 ///
 /// # Safety
 /// `call` and `args` are the fake Host's open step.
@@ -273,6 +312,10 @@ unsafe fn tool_call(call: *mut RvCall, args: &RvToolCallArgs, breach: Breach) ->
     // SAFETY: the Host keeps both strings valid for the step, and the fake
     // Host only ever sends UTF-8.
     let (tool, arguments) = unsafe { (text(args.tool), text(args.arguments)) };
+    WAKER.set(Some(args.waker));
+    // SAFETY: the Host keeps the resources valid for the step.
+    let resources = unsafe { text(args.resources) }.to_owned();
+    LENT.with_borrow_mut(|lent| lent.push((resources, args.waker.ctx.addr())));
     if !args.answer.is_null() {
         ANSWERS.set(ANSWERS.get() + 1);
     }
@@ -280,15 +323,20 @@ unsafe fn tool_call(call: *mut RvCall, args: &RvToolCallArgs, breach: Breach) ->
         // SAFETY: `call` and `args` are the fake Host's open step.
         return unsafe { asks(call, args, arguments) };
     }
+    let counts = tool == "other" || tool == "parks";
     // SAFETY: `call` is the fake Host's open step.
     let steps = unsafe { (*call).tool_call }.addr();
-    if tool == "other" && steps < 2 {
+    if counts && steps < 2 {
         // SAFETY: as above.
         unsafe { (*call).tool_call = ptr::without_provenance_mut(steps + 1) };
+        if tool == "other" {
+            // SAFETY: the open step's own waker.
+            unsafe { (args.waker.wake)(args.waker.ctx) };
+        }
         return RV_PENDING;
     }
-    let text = if tool == "other" {
-        format!("other after {steps} steps")
+    let text = if counts {
+        format!("{tool} after {steps} steps")
     } else {
         format!("{tool} {arguments}")
     };

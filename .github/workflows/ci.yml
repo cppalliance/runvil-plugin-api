@@ -32,13 +32,15 @@ jobs:
         run: cargo clippy --locked --workspace --all-targets --all-features
 
   # The layout check compiles the header with each platform's own C and C++
-  # compilers, so the tests run on all three.
+  # compilers, so the tests run on all three. The timeout fails a test that
+  # hangs, such as one that waits on a lock or a wake for good, in minutes.
   test:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 

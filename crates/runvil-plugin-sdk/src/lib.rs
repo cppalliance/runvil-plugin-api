@@ -52,6 +52,19 @@
 //! state on the path the contract names, and never lets a panic unwind
 //! into the Host.
 //!
+//! A tool call is the future [`Pack::call`] returns, and it waits as any
+//! Rust future does. The entry point polls it once per step, with a
+//! waker over the Host's waker for the call. A `Pending` parks the call,
+//! and the Host sends the next step when something wakes the future: a
+//! timer, a channel, or a task on a runtime the Plugin owns. A future
+//! that returns `Pending` without arranging a wake, and without a file
+//! request, parks for good. A long job awaits [`next_step`], which ends
+//! the step and wakes the call for the next one.
+//!
+//! [`ToolCall::resources`] lends what the Host offers every Plugin, such
+//! as the address and the key of a service: the JSON text of an object
+//! keyed by resource name, as it was when the call started.
+//!
 //! A tool reaches the files of its run through its [`ToolCall`]. It
 //! reads them with [`stat`](ToolCall::stat), [`list`](ToolCall::list),
 //! [`read`](ToolCall::read), and [`read_range`](ToolCall::read_range),
@@ -78,8 +91,18 @@
 //!   code [`export_plugin!`] expands to, and `testing`. A Plugin written
 //!   against it needs none.
 //! - What the Host lends in the answer to a file request is copied before
-//!   the step polls the call's future, so nothing a Plugin holds points
-//!   into the Host's memory.
+//!   the step polls the call's future, and the tool name, the arguments,
+//!   and the Host's resources are copied on a call's first step, so
+//!   nothing a Plugin holds points into the Host's memory.
+//! - The Host's resources can hold a key. They sit in one private type
+//!   whose `Debug` prints none of them, so no `Debug` of a [`ToolCall`]
+//!   or of the fake Host's values does.
+//! - A call's future is polled with a waker over the Host's waker for the
+//!   call. The Host keeps that waker valid until the Plugin is unloaded,
+//!   so a wake takes no lock here and may come late, from any thread.
+//!   The SDK itself wakes a call in two places: in [`next_step`], and
+//!   when the Host refuses a file request, whose failure no answer would
+//!   bring.
 //! - A panic in [`Plugin::load`] or [`Plugin::new_pack`] becomes a
 //!   refusal, a panic in a tool call ends that call as a failure, and a
 //!   panic while something the Plugin owns drops stays inside the Plugin;
@@ -116,7 +139,9 @@ pub use tool::{NextStep, ToolCall, ToolError, ToolErrorKind, ToolInfo, ToolOutpu
 /// The drop may come on any thread, and it must stop every thread the
 /// Plugin started and release everything the Plugin holds before it
 /// returns: a library Plugin's library closes right after, and a thread
-/// still running crashes the process.
+/// still running crashes the process. The waker of every tool call is
+/// gone once the drop returns too, so nothing the Plugin leaves behind
+/// may wake one.
 pub trait Plugin: Send + Sync + Sized + 'static {
     /// The name the Plugin reports: 1 to 64 bytes of lowercase ASCII
     /// letters, digits, `-`, `_`, and `.`, such as `acme-url`. A name the
