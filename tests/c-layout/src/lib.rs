@@ -33,7 +33,7 @@ mod tests {
         RV_TOOL_CHANGES_FILES, RvBytes, RvCall, RvDirEntries, RvDirEntry, RvFileAnswer,
         RvFileError, RvFileErrorKind, RvFileType, RvHost, RvLoadArgs, RvPackInfo, RvPackNewArgs,
         RvPluginInfo, RvResultKind, RvStat, RvStatus, RvStr, RvToolCallArgs, RvToolFlags,
-        RvToolInfo, RvToolResult, RvVerb,
+        RvToolInfo, RvToolResult, RvVerb, RvWaker,
     };
 
     /// One entry of the table in `layout.c`.
@@ -196,6 +196,9 @@ mod tests {
             offset!(RvPackNewArgs, pack),
             offset!(RvPackNewArgs, refuse),
             offset!(RvPackNewArgs, add_tool),
+            size!(RvWaker),
+            offset!(RvWaker, ctx),
+            offset!(RvWaker, wake),
             size!(RvToolCallArgs),
             offset!(RvToolCallArgs, size),
             offset!(RvToolCallArgs, reserved),
@@ -213,6 +216,8 @@ mod tests {
             offset!(RvToolCallArgs, file_remove),
             offset!(RvToolCallArgs, file_rename),
             offset!(RvToolCallArgs, file_copy),
+            offset!(RvToolCallArgs, resources),
+            offset!(RvToolCallArgs, waker),
             size!(RvCall),
             offset!(RvCall, size),
             offset!(RvCall, verb),

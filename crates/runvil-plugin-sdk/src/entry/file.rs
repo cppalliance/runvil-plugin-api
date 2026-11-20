@@ -199,7 +199,7 @@ mod tests {
     use runvil_plugin_sys::{
         RV_ERR_FILE, RV_ERR_MISUSE, RV_FILE_ERROR_DENIED, RV_FILE_TYPE_FILE, RV_OK, RV_PENDING,
         RvBytes, RvDirEntries, RvFileAnswer, RvFileError, RvStat, RvStatus, RvStr, RvToolCallArgs,
-        RvToolResult,
+        RvToolResult, RvWaker,
     };
 
     use super::{receive, send, text};
@@ -699,6 +699,8 @@ mod tests {
         RV_ERR_MISUSE
     }
 
+    unsafe extern "C" fn unused_wake(_ctx: *mut c_void) {}
+
     /// The arguments of a step whose `file_stat` is `file_stat`, and
     /// which carries `answer`.
     fn step_args(
@@ -722,6 +724,11 @@ mod tests {
             file_remove: unused_flag,
             file_rename: unused_pair,
             file_copy: unused_pair,
+            resources: rv_str("{}"),
+            waker: RvWaker {
+                ctx: ptr::null_mut(),
+                wake: unused_wake,
+            },
         }
     }
 

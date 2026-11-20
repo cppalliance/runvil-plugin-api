@@ -34,10 +34,10 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-runvil-plugin-sdk = { git = "https://github.com/cppalliance/runvil-plugin-api", tag = "api-v0.5.0" }
+runvil-plugin-sdk = { git = "https://github.com/cppalliance/runvil-plugin-api", tag = "api-v0.6.0" }
 
 [dev-dependencies]
-runvil-plugin-sdk = { git = "https://github.com/cppalliance/runvil-plugin-api", tag = "api-v0.5.0", features = ["test-support"] }
+runvil-plugin-sdk = { git = "https://github.com/cppalliance/runvil-plugin-api", tag = "api-v0.6.0", features = ["test-support"] }
 ```
 
 `src/lib.rs`:
@@ -130,7 +130,7 @@ Include `runvil_plugin.h` and define `RvStatus runvil_plugin(RvCall *call)`. The
 
 ## Versions
 
-The contract's version is `RV_API_MAJOR`.`RV_API_MINOR`, and `runvil-plugin-sys` carries the same version number. While the major version is 0, each version is its own contract, so a Plugin built for 0.5 loads only in a Host that speaks exactly 0.5. From 1.0, minor versions only add, and a Plugin built for 1.n loads in any Host that speaks 1.n or later.
+The contract's version is `RV_API_MAJOR`.`RV_API_MINOR`, and `runvil-plugin-sys` carries the same version number. While the major version is 0, each version is its own contract, so a Plugin built for 0.6 loads only in a Host that speaks exactly 0.6. From 1.0, minor versions only add, and a Plugin built for 1.n loads in any Host that speaks 1.n or later.
 
 Cargo allows one package per `links` value in a build, and `runvil-plugin-sys` sets `links = "runvil_plugin"`, so a Host can never link two versions of the contract into one binary.
 

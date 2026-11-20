@@ -22,7 +22,9 @@
  * - `RvHost` holds only what is true on every call: the contract version
  *   the Host speaks. Each function a Plugin may call back belongs to one
  *   verb and sits in that verb's arguments struct, behind `call->args`,
- *   beside the `ctx` pointer it takes first.
+ *   beside the `ctx` pointer it takes first. The one exception is
+ *   `wake`, which sits in the `RvWaker` of a tool call, beside the
+ *   `ctx` of that waker, and takes that `ctx`.
  * - Strings are a pointer plus a length, UTF-8, not NUL-terminated. Each
  *   string a Plugin passes has a limit in bytes, which one of the
  *   `RV_MAX_` constants names, and a longer string is a misuse. The
@@ -31,6 +33,8 @@
  *   other is valid only until the function it was passed to returns. The
  *   receiver copies what it keeps. The answer to a file request stays
  *   valid for the whole step that receives it, as the section on files
+ *   says. What the `ctx` of a tool call's waker points at stays valid
+ *   until the Plugin is unloaded, as the section on threads and lifetime
  *   says.
  * - Verb names follow `RV_<OBJECT>_<ACTION>`. Libraries open and close;
  *   Plugins load and unload.
@@ -73,23 +77,45 @@
  *
  * - A tool call is a series of steps. The Host starts the call by sending
  *   `RV_TOOL_CALL` with `call->tool_call` NULL, and that step may set
- *   `call->tool_call` to state of its own. A step that returns
- *   `RV_PENDING` asks for another step: the Host sends `RV_TOOL_CALL`
- *   again with the same `tool`, the same `arguments`, and the
- *   `call->tool_call` the last step left.
+ *   `call->tool_call` to state of its own. Each later step is an
+ *   `RV_TOOL_CALL` with the same `tool`, `arguments`, `resources`, and
+ *   `waker`, and with the `call->tool_call` the last step left.
  * - A step ends the call by calling `finish` once and returning
  *   `RV_OK`. Any return other than `RV_PENDING` ends the call, and a
  *   call that ends without a result fails.
+ * - A step that returns `RV_PENDING` parks the call. The Host sends a
+ *   parked call its next step after the Plugin wakes the call, which it
+ *   does by calling `wake` in the call's `RvWaker` with that waker's
+ *   `ctx`. A wake during a step counts, so a step that wants the next
+ *   one right away calls `wake` and then returns `RV_PENDING`. Wakes
+ *   do not add up: a wake asks for the next step that begins after it,
+ *   however many wakes come before that step.
+ * - After a step that returns `RV_PENDING` and made no file request,
+ *   the Host owes the call no step until a wake. So a Plugin wakes the
+ *   call before such a step returns, or has one of its threads wake the
+ *   call later. A call that nothing wakes can stay parked until the Host
+ *   abandons it.
+ * - A step that made a file request waits for its answer by returning
+ *   `RV_PENDING`, as the section on files says. The answer brings the
+ *   call's next step, so such a step needs no wake, and a wake does not
+ *   bring that step sooner.
+ * - The Host may also send a step that no wake asked for, but never
+ *   while a file request waits for its answer. A step that finds nothing
+ *   new to do returns `RV_PENDING` again.
  * - The Host may abandon a call between two steps, for example when its
  *   run is canceled. It then sends `RV_TOOL_CANCEL` once, with the
  *   `call->tool_call` the last step left, and no further step.
  * - A step does a bounded slice of work and returns. A step that works
  *   for long, or blocks, stalls its run, and a run can be canceled only
- *   between steps.
- * - A step that made a file request waits for its answer by returning
- *   `RV_PENDING`, as the section on files says. `RV_PENDING` is a way
- *   to wait for nothing else: after a step that made no request, the Host
- *   sends the next step as soon as the run's other work has had a turn.
+ *   between steps. A call that waits on something outside its run, such
+ *   as a reply from the network or a timer, blocks no step for it: its
+ *   step returns `RV_PENDING`, and a thread of the Plugin wakes the
+ *   call when the wait is over.
+ * - Every step is lent the Host's resources as they were when the call
+ *   started: `resources` in its `RvToolCallArgs` is the JSON text of
+ *   an object with one key for each resource the Host provides, such as
+ *   `runvil/web-search`, and `{}` when it provides none. What a resource
+ *   holds is between the Host and the Plugins that read it.
  * - A tool whose calls change files sets `RV_TOOL_CHANGES_FILES` in the
  *   `flags` of its `RvToolInfo`. Of the calls that one reply of a model
  *   asks for, the Host runs a call of such a tool by itself: the call
@@ -115,7 +141,7 @@
  *   `finish`.
  * - A step that made a request returns `RV_PENDING`. The Host sends
  *   that call its next step when the answer is ready, and no step before
- *   then.
+ *   then, even when the Plugin wakes the call.
  * - An answer's `status` is `RV_OK` or `RV_ERR_FILE`. With `RV_OK`
  *   the answer holds what the request asked for, in the one field its
  *   file function names. A function that changes the files names no
@@ -166,15 +192,27 @@
  *   call's own thread fails that call, whatever status the Plugin
  *   returns. A function called on another thread while its call runs
  *   returns `RV_ERR_MISUSE` and has no other effect.
+ * - `wake` is the one function those rules do not bind. The Plugin may
+ *   call the `wake` of a tool call's `RvWaker`, with that waker's
+ *   `ctx`, on any thread and any number of times, from the call's first
+ *   step until `RV_PLUGIN_UNLOAD` returns: during a step, between two
+ *   steps, during `RV_TOOL_CANCEL`, and after the call has ended. It
+ *   returns nothing. It only notes the wake and returns: it calls
+ *   nothing of the Plugin's and does not block, so a Plugin may call it
+ *   while it holds a lock.
  * - The Host keeps the `ctx` of a load valid while the Plugin is loaded,
  *   until `RV_PLUGIN_UNLOAD` returns, so a late call through it is
- *   answered `RV_ERR_MISUSE` instead of reaching freed memory. The `ctx`
- *   of a load the Host rejects, and the `ctx` of every other call, is
- *   gone once the call returns, and the Plugin must not use it.
+ *   answered `RV_ERR_MISUSE` instead of reaching freed memory. It
+ *   keeps what the `ctx` of every waker points at valid until then too,
+ *   so a late wake reaches no freed memory either: a wake after its call
+ *   has ended does nothing for that call. The `ctx` of a load the Host
+ *   rejects, and the `ctx` of every other call, is gone once the call
+ *   returns, and the Plugin must not use it.
  * - `RV_PLUGIN_UNLOAD` must stop every thread the Plugin started and
  *   release everything it holds before it returns. A library Plugin's
  *   library closes right after, and a thread still running crashes the
- *   process.
+ *   process. Every waker is gone once it returns, so the Plugin calls no
+ *   `wake` after that.
  *
  * # What the Plugin frees
  *
@@ -191,6 +229,8 @@
  *   returns. A call that is abandoned gets `RV_TOOL_CANCEL` instead,
  *   which frees the state; its `call->tool_call` is NULL when no step set
  *   it. Each call gets one or the other, never both.
+ * - A waker belongs to the Host, with what its `ctx` points at. The
+ *   Plugin copies the `RvWaker` it keeps and frees nothing of it.
  *
  * # Reserved numbers
  *
@@ -208,8 +248,9 @@
  * - `RV_ERR_UNSUPPORTED` (6) means the Plugin cannot answer the call: it
  *   does not know the verb, the Host reports a version the Plugin was not
  *   built for, or a struct's `size` is smaller than the Plugin expects.
- * - `RV_PENDING` (7) means a tool call needs another step. Only
- *   `RV_TOOL_CALL` returns it.
+ * - `RV_PENDING` (7) means a tool call is parked: the Host sends its
+ *   next step after the Plugin wakes the call, or when the answer to the
+ *   step's file request is ready. Only `RV_TOOL_CALL` returns it.
  * - `RV_ERR_FILE` (8) means a file operation failed. No function
  *   returns it: it is the `status` of an `RvFileAnswer`, whose `error`
  *   says what went wrong.
@@ -253,6 +294,7 @@ typedef struct RvToolResult RvToolResult;
 typedef struct RvHost RvHost;
 typedef struct RvLoadArgs RvLoadArgs;
 typedef struct RvPackNewArgs RvPackNewArgs;
+typedef struct RvWaker RvWaker;
 typedef struct RvToolCallArgs RvToolCallArgs;
 typedef struct RvCall RvCall;
 
@@ -264,7 +306,7 @@ typedef struct RvCall RvCall;
 /**
  * The contract's minor version, which `RvHost` reports.
  */
-#define RV_API_MINOR 5
+#define RV_API_MINOR 6
 
 /**
  * The most bytes in a name segment, a version, or a wire name.
@@ -297,8 +339,9 @@ typedef struct RvCall RvCall;
 #define RV_MAX_WRITE 16777216
 
 /**
- * What every function in the contract returns, and the `status` of an
- * `RvFileAnswer`: zero for success.
+ * What every function in the contract returns, except `wake`, which
+ * returns nothing, and the `status` of an `RvFileAnswer`: zero for
+ * success.
  */
 typedef uint32_t RvStatus;
 
@@ -661,10 +704,32 @@ struct RvPackNewArgs {
 };
 
 /**
+ * Wakes one tool call. The Plugin may call `wake` from any thread, any
+ * number of times, from the call's first step until
+ * `RV_PLUGIN_UNLOAD` returns. The Host keeps what `ctx` points at
+ * valid until then. A wake after its call has ended does nothing for
+ * that call.
+ */
+struct RvWaker {
+  /**
+   * The Host's context for the waker, passed back to `wake`. The
+   * Plugin never reads through it.
+   */
+  void *ctx;
+  /**
+   * Asks the Host to send the call's next step. It only notes the
+   * wake and returns: it calls nothing of the Plugin's and does not
+   * block, so a Plugin may call it while it holds a lock.
+   */
+  void (*wake)(void *ctx);
+};
+
+/**
  * The arguments of `RV_TOOL_CALL`: the tool, its arguments, the
- * function that ends the call, the file functions, and the answer to the
- * file request of the call's last step. Every step of one call gets the
- * same `tool` and `arguments`.
+ * function that ends the call, the file functions, the answer to the
+ * file request of the call's last step, the Host's resources, and the
+ * call's waker. Every step of one call gets the same `tool`,
+ * `arguments`, `resources`, and `waker`.
  */
 struct RvToolCallArgs {
   /**
@@ -755,6 +820,19 @@ struct RvToolCallArgs {
    * is there.
    */
   RvStatus (*file_copy)(void *ctx, struct RvStr from, struct RvStr to);
+  /**
+   * The Host's resources as they were when the call started: the JSON
+   * text of an object with one key for each resource the Host
+   * provides, such as `runvil/web-search`, and `{}` when it provides
+   * none. Every step of one call gets the same text. Like `tool` and
+   * `arguments`, it is valid for the step.
+   */
+  struct RvStr resources;
+  /**
+   * The waker of this call. Every step of one call gets the same one.
+   * Its `wake` takes the waker's own `ctx`, not the `ctx` of the step.
+   */
+  struct RvWaker waker;
 };
 
 /**
@@ -822,7 +900,12 @@ struct RvCall {
 #define RV_ERR_UNSUPPORTED 6
 
 /**
- * The tool call needs another step; only `RV_TOOL_CALL` returns it.
+ * The tool call is parked. The Host sends its next step after the
+ * Plugin wakes the call, or, when the step made a file request, when
+ * the answer is ready. A wake during the step counts, so a step that
+ * wants the next one right away calls `wake` and then returns this. A
+ * step may also come that no wake asked for, but never while a file
+ * request waits for its answer. Only `RV_TOOL_CALL` returns it.
  */
 #define RV_PENDING 7
 

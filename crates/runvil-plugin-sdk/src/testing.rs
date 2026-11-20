@@ -53,7 +53,7 @@ use std::{mem, ptr};
 use runvil_plugin_sys::{
     PluginEntry, RV_API_MAJOR, RV_API_MINOR, RV_OK, RV_PACK_DELETE, RV_PACK_NEW, RV_PENDING,
     RV_PLUGIN_LOAD, RV_PLUGIN_UNLOAD, RV_TOOL_CALL, RV_TOOL_CANCEL, RvCall, RvHost, RvLoadArgs,
-    RvPackNewArgs, RvStatus, RvToolCallArgs,
+    RvPackNewArgs, RvStatus, RvToolCallArgs, RvWaker,
 };
 
 use self::session::{Described, Session, Verb};
@@ -395,6 +395,11 @@ impl Call<'_> {
                 file_remove: file::file_remove,
                 file_rename: file::file_rename,
                 file_copy: file::file_copy,
+                resources: rv_str("{}"),
+                waker: RvWaker {
+                    ctx: ptr::null_mut(),
+                    wake,
+                },
             };
             call.args = (&raw const args).cast();
             // SAFETY: `load_entry`'s caller guaranteed `entry` follows the
@@ -452,6 +457,11 @@ pub enum Failure {
     /// `RV_TOOL_CALL` returned `RV_OK` without finishing the call.
     Unfinished,
 }
+
+/// The `wake` of the waker every step is handed. It notes nothing: this
+/// fake Host sends a pending call its next step without waiting for a
+/// wake, which the contract allows.
+unsafe extern "C" fn wake(_ctx: *mut c_void) {}
 
 /// The `RvHost` every call hands the Plugin.
 static HOST: RvHost = RvHost {
