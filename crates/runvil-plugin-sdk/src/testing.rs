@@ -44,7 +44,8 @@
 //! parameters, compared as text, which is stricter than the Harness; a
 //! tool of the instance that the section did not offer is not listed; and
 //! no two tools show one wire name. A broken rule is a
-//! [`Failure::Rejected`] that names the tool.
+//! [`Failure::Rejected`] that names the tool. A model-facing tool that the
+//! render listed is called with [`PackRun::call`] under that name.
 //!
 //! Every call is lent the Host's resources, the JSON text of an object.
 //! It is `{}` unless [`PackRun::with_resources`] gives the run another:
@@ -229,6 +230,7 @@ impl Loaded {
             pack_id: pack.split_once('/').map_or(pack, |(_, id)| id).to_owned(),
             instance: call.pack_run,
             tools: mem::take(&mut session.tools),
+            rendered: RefCell::new(Vec::new()),
             files: Files::new(),
             resources: Resources::new("{}"),
         })
@@ -292,6 +294,9 @@ pub struct PackRun<'a> {
     /// What `RV_PACK_NEW` left in `call->pack_run`.
     instance: *mut c_void,
     tools: Vec<ToolInfo>,
+    /// The names of the model-facing tools a render of this instance has
+    /// listed, which a test may call as the model does.
+    rendered: RefCell<Vec<String>>,
     /// The run's files, which the file requests of each call are
     /// performed on.
     files: Files,
@@ -344,9 +349,10 @@ impl PackRun<'_> {
     /// breaks the contract; see [`Call::step`].
     ///
     /// # Panics
-    /// Panics when the instance added no tool named `tool`, which the
-    /// Harness never calls, and when a step parks the call and the Plugin
-    /// does not wake it within 60 seconds; see [`Call::wait`].
+    /// Panics when the instance added no tool named `tool` and no render
+    /// of it has listed one, which the Harness never calls, and when a
+    /// step parks the call and the Plugin does not wake it within 60
+    /// seconds; see [`Call::wait`].
     pub fn call(&self, tool: &str, arguments: &str) -> Result<ToolResult, Failure> {
         let mut call = self.start(tool, arguments);
         loop {
@@ -362,12 +368,15 @@ impl PackRun<'_> {
     /// until the first [`Call::step`].
     ///
     /// # Panics
-    /// Panics when the instance added no tool named `tool`, which the
-    /// Harness never calls.
+    /// Panics when the instance added no tool named `tool` and no render
+    /// of it has listed one, which the Harness never calls. A model-facing
+    /// tool that [`PackRun::render`] listed is called by the name it was
+    /// listed under, as a model calls it.
     #[must_use]
     pub fn start(&self, tool: &str, arguments: &str) -> Call<'_> {
         assert!(
-            self.tools.iter().any(|added| added.name == tool),
+            self.tools.iter().any(|added| added.name == tool)
+                || self.rendered.borrow().iter().any(|listed| listed == tool),
             "the Pack instance has no tool named {tool}"
         );
         Call {

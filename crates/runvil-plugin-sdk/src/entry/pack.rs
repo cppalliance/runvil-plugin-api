@@ -156,6 +156,8 @@ pub(super) unsafe fn render(call: *mut RvCall) -> RvStatus {
                 "the Pack panicked while it rendered: {}",
                 panic_message(&*payload)
             ));
+            // The payload belongs to the Pack, and its drop may panic.
+            contain(move || drop(payload));
             // SAFETY: as above.
             return unsafe { refuse(args.refuse, args.ctx, &refusal) };
         }
@@ -487,6 +489,17 @@ mod tests {
         Refuses,
         /// Panics.
         Panics,
+        /// Panics with a payload whose drop panics too.
+        PanicsWithBomb,
+    }
+
+    /// A panic payload whose drop panics.
+    struct Bomb;
+
+    impl Drop for Bomb {
+        fn drop(&mut self) {
+            panic!("the payload's drop panics");
+        }
     }
 
     impl Pack for Renders {
@@ -520,6 +533,7 @@ mod tests {
                 }
                 Renders::Refuses => Err(Refusal::new("no tools for this model")),
                 Renders::Panics => panic!("boom"),
+                Renders::PanicsWithBomb => std::panic::panic_any(Bomb),
             }
         }
     }
@@ -642,6 +656,16 @@ mod tests {
         assert_eq!(
             recorder.refusals,
             ["the Pack panicked while it rendered: boom"]
+        );
+    }
+
+    #[test]
+    fn a_panic_payload_whose_drop_panics_is_contained_and_the_render_is_refused() {
+        let (status, recorder) = render_with(Renders::PanicsWithBomb, None, |_, _| {});
+        assert_eq!(status, RV_ERR_REFUSED);
+        assert_eq!(
+            recorder.refusals,
+            ["the Pack panicked while it rendered: a panic payload that is not text"]
         );
     }
 

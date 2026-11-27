@@ -69,7 +69,8 @@ impl PackRun<'_> {
     ///   wire name or description passes both.
     /// - A tool listed under the name of a tool of this instance that the
     ///   section did not offer fails.
-    /// - Any other name is a model-facing tool, and passes.
+    /// - Any other name is a model-facing tool, and passes. A test may then
+    ///   call it by that name, as a model does.
     /// - No two tools may show one wire name, the default one included.
     ///
     /// # Errors
@@ -129,6 +130,9 @@ impl PackRun<'_> {
         session.rejection(status)?;
         let listed = mem::take(&mut session.tools);
         self.check_render(offered, &listed)?;
+        self.rendered
+            .borrow_mut()
+            .extend(listed.iter().map(|tool| tool.name.clone()));
         Ok(listed)
     }
 
@@ -268,6 +272,7 @@ mod tests {
             PackInfo::new("acme/badname"),
             PackInfo::new("acme/dots"),
             PackInfo::new("acme/spaced"),
+            PackInfo::new("acme/inherits"),
         ];
 
         fn load() -> Result<Renderer, Refusal> {
@@ -287,9 +292,23 @@ mod tests {
                 "acme/clashes" => Mode::ClashesWithDefault,
                 "acme/dots" => Mode::Dotted,
                 "acme/spaced" => Mode::Respaced,
+                "acme/inherits" => return Ok(Box::new(Inherits)),
                 _ => Mode::BadName,
             };
             Ok(Box::new(Shaper(mode)))
+        }
+    }
+
+    /// A Pack that does not override `render`.
+    struct Inherits;
+
+    impl Pack for Inherits {
+        fn tools(&self) -> Vec<ToolInfo> {
+            catalog()
+        }
+
+        fn call<'a>(&'a self, _call: ToolCall<'a>) -> BoxFuture<'a, Result<ToolOutput, ToolError>> {
+            Box::pin(async { Ok(ToolOutput::trusted("")) })
         }
     }
 
@@ -380,6 +399,37 @@ mod tests {
             Ok(catalog()[..1].to_vec())
         );
         assert_eq!(render("acme/plain", &[]), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn a_pack_that_inherits_the_default_render_lists_what_it_was_offered_in_order() {
+        let mut backwards = catalog();
+        backwards.reverse();
+        assert_eq!(
+            render("acme/inherits", &backwards),
+            Ok(backwards),
+            "the default keeps every tool, its order, and its text"
+        );
+        assert_eq!(render("acme/inherits", &[]), Ok(Vec::new()));
+    }
+
+    #[test]
+    fn a_test_calls_a_model_facing_tool_by_the_name_a_render_listed_it_under() {
+        let loaded = testing::load::<Renderer>().unwrap();
+        let run = loaded.new_pack("acme/reshape").unwrap();
+        run.render(ENTRY, MODEL, &catalog()).unwrap();
+        assert_eq!(
+            run.call("lite", "{}"),
+            Ok(Ok(ToolOutput::trusted("called lite")))
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "the Pack instance has no tool named lite")]
+    fn a_model_facing_tool_is_not_callable_before_a_render_lists_it() {
+        let loaded = testing::load::<Renderer>().unwrap();
+        let run = loaded.new_pack("acme/reshape").unwrap();
+        let _call = run.start("lite", "{}");
     }
 
     #[test]

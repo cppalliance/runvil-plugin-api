@@ -86,10 +86,11 @@
 //! lists the tools the model sees. A tool listed under the name of an
 //! offered tool is that catalog tool: it may take another wire name and
 //! description, and its parameters stay as offered, so one catalog name
-//! always means one parameter schema. A tool listed under any other name
-//! is a model-facing tool, which only a model calls and which a Pack
-//! answers by its own name. A Pack that does not override `render` shows
-//! the offered tools as they are.
+//! always means one parameter schema. A tool listed under a name that no
+//! tool of the instance's catalog has is a model-facing tool, which only a
+//! model calls and which a Pack answers by its own name. A catalog tool
+//! the section did not offer may not be listed. A Pack that does not
+//! override `render` shows the offered tools as they are.
 //!
 //! The `test-support` feature adds `testing`, a fake Host for a Plugin
 //! crate's own tests.

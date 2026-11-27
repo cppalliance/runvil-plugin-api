@@ -105,13 +105,14 @@ Models are trained on particular tool shapes. A Claude model expects a string-re
 
 - A tool the Pack leaves out of the answer is not shown to the model.
 - A tool the Pack lists under the `name` of an offered tool is that catalog tool. It may take another `wire_name` and `description`, and its `parameters` stay as offered. So one catalog name always means one parameter schema, and Lua can still call the tool by its id.
-- A tool the Pack lists under any other name is a **model-facing tool**. Only a model calls it, and no script can name it. It is how a model sees other parameters than the catalog's: the Pack lists it under a name of its own, and `Pack::call` answers its calls by that name.
+- A tool the Pack lists under a name that no tool of its catalog has is a **model-facing tool**. Only a model calls it, and no script can name it. It is how a model sees other parameters than the catalog's: the Pack lists it under a name of its own, and `Pack::call` answers its calls by that name. A catalog tool the section did not offer may not be listed under its own name.
 
 For example, a Pack `acme/fs` lists the catalog tool `edit`, which takes `path`, `old`, and `new`. For a Claude model it renders `edit` out and lists a model-facing tool `str_replace` with the wire name `str_replace_based_edit_tool` and the parameters that model was trained on. For an OpenAI model it lists `apply_patch`, with one parameter that holds a diff. Every other model sees `edit` as it is, which is the default. A model-facing tool that changes files says so with `ToolInfo::changes_files()`, because the Host does not copy that flag from the catalog.
 
 ```rust
 fn render(&self, cx: &RenderContext<'_>, offered: Vec<ToolInfo>) -> Result<Vec<ToolInfo>, Refusal> {
-    if !cx.model.contains("claude") {
+    let model = serde_json::from_str::<serde_json::Value>(cx.model).unwrap_or_default();
+    if !model["name"].as_str().unwrap_or_default().contains("claude") {
         return Ok(offered);
     }
     let mut shown: Vec<ToolInfo> = offered.into_iter().filter(|tool| tool.name != "edit").collect();
@@ -161,12 +162,13 @@ assert_eq!(pack.files().read("/notes/b.md", 0, u64::MAX), Ok(b"three\n".to_vec()
 A Pack that renders is tested with `PackRun::render(entry, model, offered)`, which sends `RV_PACK_RENDER` with the tools the section offered and returns the tools the model is shown:
 
 ```rust
+let loaded = testing::load::<Fs>().unwrap();
 let pack = loaded.new_pack("acme/fs").unwrap();
 let shown = pack.render("entry-1", r#"{"name":"claude-x"}"#, pack.tools()).unwrap();
 assert_eq!(shown[0].wire_name.as_deref(), Some("str_replace_based_edit_tool"));
 ```
 
-It checks each listed tool as the Harness does, and then the render as a whole: a catalog tool must keep its offered `parameters`, a tool of the instance the section did not offer may not be listed, and no two tools may show one wire name. A broken rule is a `Failure::Rejected` whose text names the tool. The fake Host compares `parameters` as text, which is stricter than the Harness, which compares the JSON they hold. A render that lists the offered `ToolInfo` with another wire name or description passes both.
+It checks each listed tool as the Harness does, and then the render as a whole: a catalog tool must keep its offered `parameters`, a tool of the instance the section did not offer may not be listed, and no two tools may show one wire name. A broken rule is a `Failure::Rejected` whose text names the tool. The fake Host compares `parameters` as text, which is stricter than the Harness, which compares the JSON they hold. A render that lists the offered `ToolInfo` with another wire name or description passes both. A model-facing tool that a render listed is then called with `PackRun::call` under the name it was listed under, as a model calls it.
 
 ### Linked and library builds of one Plugin
 
