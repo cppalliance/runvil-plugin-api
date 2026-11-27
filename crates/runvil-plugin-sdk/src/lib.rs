@@ -89,8 +89,8 @@
 //! always means one parameter schema. A tool listed under a name that no
 //! tool of the instance's catalog has is a model-facing tool, which only a
 //! model calls and which a Pack answers by its own name. A catalog tool
-//! the section did not offer may not be listed. A Pack that does not
-//! override `render` shows the offered tools as they are.
+//! the section did not offer in this set may not be listed. A Pack that
+//! does not override `render` shows the offered tools as they are.
 //!
 //! The `test-support` feature adds `testing`, a fake Host for a Plugin
 //! crate's own tests.

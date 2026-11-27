@@ -72,9 +72,9 @@
  * - An instance's catalog tools are the ones it adds during
  *   `RV_PACK_NEW`, and they stay fixed for the run. A render may list
  *   other tools for a model, as the section on renders says. The Host
- *   forms each tool's id from the
- *   Pack's id, which is the second segment of the Pack's name, and the
- *   tool's name: the tool `fetch` of the Pack `acme/url` is `url/fetch`.
+ *   forms each tool's id from the Pack's id, which is the second segment
+ *   of the Pack's name, and the tool's name: the tool `fetch` of the Pack
+ *   `acme/url` is `url/fetch`.
  * - `RV_PACK_NEW` runs while the Host prepares a run, so it returns
  *   promptly: it does not block and does no I/O. What is costly to make
  *   belongs in the Plugin instance, which every run shares.

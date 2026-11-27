@@ -130,9 +130,9 @@ pub trait Pack: Send + Sync + 'static {
     ///   calls by that name. It takes the flags it is given, so a
     ///   model-facing tool that changes files says so with
     ///   [`ToolInfo::changes_files`].
-    /// - A catalog tool the section did not offer may not be listed, under
-    ///   its own name or any other that the catalog has: the Host fails
-    ///   the round that asked for the render.
+    /// - A catalog tool the section did not offer in this set may not be
+    ///   listed, under its own name or any other that the catalog has: the
+    ///   Host fails the round that asked for the render.
     ///
     /// It returns promptly: it does not block and does no I/O. It may
     /// run on any thread and at the same time as calls of this instance.
