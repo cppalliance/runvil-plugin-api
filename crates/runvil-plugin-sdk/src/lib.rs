@@ -79,6 +79,18 @@
 //! [`ToolInfo::changes_files`], and the Host then runs each of its calls
 //! by itself among the calls one reply of a model asks for.
 //!
+//! A Pack may shape what a model is shown with [`Pack::render`]. The Host
+//! calls it when a section entry's first model round is about to
+//! advertise its tools, with the section entry, the model as JSON text,
+//! and the catalog tools the section offered from the Pack. The answer
+//! lists the tools the model sees. A tool listed under the name of an
+//! offered tool is that catalog tool: it may take another wire name and
+//! description, and its parameters stay as offered, so one catalog name
+//! always means one parameter schema. A tool listed under any other name
+//! is a model-facing tool, which only a model calls and which a Pack
+//! answers by its own name. A Pack that does not override `render` shows
+//! the offered tools as they are.
+//!
 //! The `test-support` feature adds `testing`, a fake Host for a Plugin
 //! crate's own tests.
 //!
@@ -104,7 +116,8 @@
 //!   when the Host refuses a file request, whose failure no answer would
 //!   bring.
 //! - A panic in [`Plugin::load`] or [`Plugin::new_pack`] becomes a
-//!   refusal, a panic in a tool call ends that call as a failure, and a
+//!   refusal, a panic in [`Pack::render`] becomes a refusal of that
+//!   render, a panic in a tool call ends that call as a failure, and a
 //!   panic while something the Plugin owns drops stays inside the Plugin;
 //!   none unwinds across the C boundary.
 //! - The Plugin instance is made on the loading thread, may be dropped on

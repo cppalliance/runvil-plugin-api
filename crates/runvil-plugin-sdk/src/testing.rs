@@ -37,6 +37,15 @@
 //! call that nothing wakes fails its test after 60 seconds, with a
 //! sentence that says so, and does not hang it.
 //!
+//! A Pack that renders is tested with [`PackRun::render`], which sends
+//! `RV_PACK_RENDER` with the tools a section offered and returns the tools
+//! the model is shown. It checks each tool as `RV_PACK_NEW` checks one, and
+//! then the render as a whole: a catalog tool keeps its offered
+//! parameters, compared as text, which is stricter than the Harness; a
+//! tool of the instance that the section did not offer is not listed; and
+//! no two tools show one wire name. A broken rule is a
+//! [`Failure::Rejected`] that names the tool.
+//!
 //! Every call is lent the Host's resources, the JSON text of an object.
 //! It is `{}` unless [`PackRun::with_resources`] gives the run another:
 //!
@@ -59,6 +68,7 @@ mod fixture;
 mod json;
 mod load;
 mod pack;
+mod render;
 mod session;
 mod tree;
 mod wake;
@@ -216,6 +226,7 @@ impl Loaded {
         session.rejection(status)?;
         Ok(PackRun {
             loaded: self,
+            pack_id: pack.split_once('/').map_or(pack, |(_, id)| id).to_owned(),
             instance: call.pack_run,
             tools: mem::take(&mut session.tools),
             files: Files::new(),
@@ -275,6 +286,9 @@ pub struct InsertedPack {
 #[derive(Debug)]
 pub struct PackRun<'a> {
     loaded: &'a Loaded,
+    /// The Pack's id, the second segment of its name, which the tool ids
+    /// and the default wire names of its tools start with.
+    pack_id: String,
     /// What `RV_PACK_NEW` left in `call->pack_run`.
     instance: *mut c_void,
     tools: Vec<ToolInfo>,
@@ -575,6 +589,9 @@ pub enum Failure {
     Undescribed,
     /// `RV_TOOL_CALL` returned `RV_OK` without finishing the call.
     Unfinished,
+    /// `RV_PACK_RENDER` returned `RV_OK`, and the Harness rejects what the
+    /// render listed, for the reason given, which names the tool.
+    Rejected(String),
 }
 
 /// The `RvHost` every call hands the Plugin.

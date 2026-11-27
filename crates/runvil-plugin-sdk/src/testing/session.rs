@@ -28,6 +28,8 @@ pub(super) enum Verb {
     Load,
     /// `RV_PACK_NEW`.
     PackNew,
+    /// `RV_PACK_RENDER`.
+    PackRender,
     /// `RV_TOOL_CALL`.
     ToolCall,
 }
@@ -46,7 +48,7 @@ pub(super) struct Session {
     pub(super) described: Option<Described>,
     /// The Packs a load inserted, in order.
     pub(super) packs: Vec<InsertedPack>,
-    /// The tools an `RV_PACK_NEW` added, in order.
+    /// The tools an `RV_PACK_NEW` or an `RV_PACK_RENDER` added, in order.
     pub(super) tools: Vec<ToolInfo>,
     /// The result a step finished its call with.
     pub(super) result: Option<Result<ToolOutput, ToolError>>,
@@ -140,6 +142,13 @@ pub(super) const PACK_NEW: Family = Family {
     verb: Verb::PackNew,
     wrong_ctx: "a Pack function was handed a ctx other than the open RV_PACK_NEW call's",
     wrong_call: "a Pack function was called outside RV_PACK_NEW",
+};
+
+/// The functions in an `RvPackRenderArgs`.
+pub(super) const PACK_RENDER: Family = Family {
+    verb: Verb::PackRender,
+    wrong_ctx: "a render function was handed a ctx other than the open RV_PACK_RENDER call's",
+    wrong_call: "a render function was called outside RV_PACK_RENDER",
 };
 
 /// The functions in an `RvToolCallArgs`.

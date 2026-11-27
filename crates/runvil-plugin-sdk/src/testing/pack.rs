@@ -1,6 +1,7 @@
 //! The functions a fake Host's `RvPackNewArgs` carries: `refuse` and
 //! `add_tool`, each checking what the Plugin hands it as the Harness
-//! does.
+//! does. The checks of one tool are shared with `RV_PACK_RENDER`, whose
+//! functions sit in the `render` module.
 
 use std::ffi::c_void;
 
@@ -9,7 +10,7 @@ use runvil_plugin_sys::{
 };
 
 use super::json;
-use super::session::{self, Field, PACK_NEW, Shape, answer, field, shape};
+use super::session::{self, Family, Field, PACK_NEW, Shape, answer, field, shape};
 use crate::ToolInfo;
 use crate::names::{is_valid_name, is_valid_wire_name};
 
@@ -27,20 +28,44 @@ pub(super) unsafe extern "C" fn refuse(ctx: *mut c_void, reason: RvStr) -> RvSta
 /// Records one tool the instance adds, validated; returns `RV_OK` or
 /// `RV_ERR_MISUSE`.
 pub(super) unsafe extern "C" fn add_tool(ctx: *mut c_void, info: *const RvToolInfo) -> RvStatus {
-    answer(ctx, &PACK_NEW, |session| {
-        // SAFETY: the contract makes `info` point at a readable
-        // `RvToolInfo` during this call.
+    // SAFETY: the contract makes `info` point at a readable `RvToolInfo`
+    // with valid strings during this call.
+    unsafe {
+        add(
+            ctx,
+            &PACK_NEW,
+            info,
+            "two tools of one Pack instance share a name",
+        )
+    }
+}
+
+/// Records one tool that the open call of `family` is given, validated:
+/// the rules of a tool's fields are the same for `RV_PACK_NEW` and
+/// `RV_PACK_RENDER`. `twice` names a repeated name.
+///
+/// # Safety
+/// `info` must be NULL or point at a readable `RvToolInfo` whose strings
+/// are valid for their lengths, for the duration of the call.
+pub(super) unsafe fn add(
+    ctx: *mut c_void,
+    family: &Family,
+    info: *const RvToolInfo,
+    twice: &'static str,
+) -> RvStatus {
+    answer(ctx, family, |session| {
+        // SAFETY: the caller makes `info` readable if it is not NULL.
         let info = unsafe { TOOL_INFO.read(info) }?;
         if info.flags & !RV_TOOL_CHANGES_FILES != 0 {
             return Err("the tool's flags set a bit that is not one of the RV_TOOL constants");
         }
-        // SAFETY: the contract makes each string valid for its length.
+        // SAFETY: the caller makes each string valid for its length.
         let name = unsafe { TOOL_NAME.read(info.name) }?;
         if !is_valid_name(&name) {
             return Err("the tool's name is not one name segment, such as `fetch`");
         }
         if session.tools.iter().any(|tool| tool.name == name) {
-            return Err("two tools of one Pack instance share a name");
+            return Err(twice);
         }
         // SAFETY: as above.
         let wire_name = unsafe { WIRE_NAME.read(info.wire_name) }?;

@@ -10,12 +10,13 @@ The contract between a runvil Host and its Plugins: a C header, the raw Rust mir
 
 ## What a Plugin does
 
-A Plugin loads once, names itself, and inserts its Packs. For each run that holds one of those Packs, the Host asks the Plugin for an instance of it, and the instance lists its tools. The Host then runs each tool call as a series of short steps, and frees the instance when the run ends.
+A Plugin loads once, names itself, and inserts its Packs. For each run that holds one of those Packs, the Host asks the Plugin for an instance of it, and the instance lists its tools. When a section of a prompt is about to show a model its tools, the Host may ask the instance which tools that model should see. The Host then runs each tool call as a series of short steps, and frees the instance when the run ends.
 
 | Verb | When the Host sends it |
 |---|---|
 | `RV_PLUGIN_LOAD` | Once, as the Host inserts the Plugin |
 | `RV_PACK_NEW` | Once for each run that holds one of the Plugin's Packs |
+| `RV_PACK_RENDER` | When a section entry's first model round is about to show its tools, once for each of the section's two sets of tools that holds a tool of the Pack |
 | `RV_TOOL_CALL` | Once for each step of a tool call, until a step ends the call |
 | `RV_TOOL_CANCEL` | When the Host abandons a call between two steps |
 | `RV_PACK_DELETE` | When the run ends |
@@ -34,10 +35,10 @@ edition = "2024"
 crate-type = ["cdylib"]
 
 [dependencies]
-runvil-plugin-sdk = { git = "https://github.com/cppalliance/runvil-plugin-api", tag = "api-v0.6.0" }
+runvil-plugin-sdk = { git = "https://github.com/cppalliance/runvil-plugin-api", tag = "api-v0.7.0" }
 
 [dev-dependencies]
-runvil-plugin-sdk = { git = "https://github.com/cppalliance/runvil-plugin-api", tag = "api-v0.6.0", features = ["test-support"] }
+runvil-plugin-sdk = { git = "https://github.com/cppalliance/runvil-plugin-api", tag = "api-v0.7.0", features = ["test-support"] }
 ```
 
 `src/lib.rs`:
@@ -96,6 +97,35 @@ export_plugin!(Acme);
 - A tool that changes files says so with `ToolInfo::changes_files()`. Of the calls one reply of a model asks for, the Host runs a call of such a tool by itself, so two changes of one reply happen in the order the reply lists them.
 - A panic in `load` or `new_pack` reaches the Host as a refusal, and a panic in a tool call ends that call as a failure. Neither unwinds into the Host.
 
+### Catalog tools and model-facing tools
+
+A tool a Pack lists when its instance is made, with `tools`, is a **catalog tool**. A prompt's Lua can call it by its id, such as `fs/edit`, a section offers it to a model with `tools.offer("fs/edit")` or offers the whole Pack with `tools.offer("fs")`, and its parameters are the same for the whole run, so a prompt author can read them in the Host's docs.
+
+Models are trained on particular tool shapes. A Claude model expects a string-replace tool, and an OpenAI model expects a tool that takes a diff. A Pack shows each model the shape it was trained on with `Pack::render`, which the Host calls when a section entry's first model round is about to advertise its tools. `render` gets the section entry, the model as JSON text, and the catalog tools the section offered, and returns the tools the model is shown. The Host keeps that answer for the whole section entry.
+
+- A tool the Pack leaves out of the answer is not shown to the model.
+- A tool the Pack lists under the `name` of an offered tool is that catalog tool. It may take another `wire_name` and `description`, and its `parameters` stay as offered. So one catalog name always means one parameter schema, and Lua can still call the tool by its id.
+- A tool the Pack lists under any other name is a **model-facing tool**. Only a model calls it, and no script can name it. It is how a model sees other parameters than the catalog's: the Pack lists it under a name of its own, and `Pack::call` answers its calls by that name.
+
+For example, a Pack `acme/fs` lists the catalog tool `edit`, which takes `path`, `old`, and `new`. For a Claude model it renders `edit` out and lists a model-facing tool `str_replace` with the wire name `str_replace_based_edit_tool` and the parameters that model was trained on. For an OpenAI model it lists `apply_patch`, with one parameter that holds a diff. Every other model sees `edit` as it is, which is the default. A model-facing tool that changes files says so with `ToolInfo::changes_files()`, because the Host does not copy that flag from the catalog.
+
+```rust
+fn render(&self, cx: &RenderContext<'_>, offered: Vec<ToolInfo>) -> Result<Vec<ToolInfo>, Refusal> {
+    if !cx.model.contains("claude") {
+        return Ok(offered);
+    }
+    let mut shown: Vec<ToolInfo> = offered.into_iter().filter(|tool| tool.name != "edit").collect();
+    shown.push(
+        ToolInfo::new("str_replace", "Replace one exact string in a file.", STR_REPLACE_SCHEMA)
+            .wire_name("str_replace_based_edit_tool")
+            .changes_files(),
+    );
+    Ok(shown)
+}
+```
+
+A prompt names catalog ids only, and its prose describes a tool by what it does and not by the name a model sees. A prompt that offers a Pack trusts that Pack's render to choose the model-facing tools, so a Plugin that needs a prompt to offer reading without editing inserts two Packs.
+
 ### Testing
 
 With `test-support` on, `runvil_plugin_sdk::testing` is a fake Host that speaks the contract to the Plugin's entry point and checks every call the Plugin makes back the way the Harness does:
@@ -128,17 +158,27 @@ assert_eq!(pack.files().read("/notes/b.md", 0, u64::MAX), Ok(b"three\n".to_vec()
 
 `file` and `dir` add a node and every directory on the way to it, and `fails` makes every operation on a path fail with the error given, a change included, as a path the run's policy denies does. A path that fails has nothing under it: `fails` refuses a directory that has entries, because those entries would stay readable, and a change that would make something under it fails with the same error. The calls of one `PackRun` share the tree, and `PackRun::files` lends it to the test, which reads what a call left there. The fake Host performs a file request on the tree once the step that made it has returned, and lends the call's next step the answer.
 
+A Pack that renders is tested with `PackRun::render(entry, model, offered)`, which sends `RV_PACK_RENDER` with the tools the section offered and returns the tools the model is shown:
+
+```rust
+let pack = loaded.new_pack("acme/fs").unwrap();
+let shown = pack.render("entry-1", r#"{"name":"claude-x"}"#, pack.tools()).unwrap();
+assert_eq!(shown[0].wire_name.as_deref(), Some("str_replace_based_edit_tool"));
+```
+
+It checks each listed tool as the Harness does, and then the render as a whole: a catalog tool must keep its offered `parameters`, a tool of the instance the section did not offer may not be listed, and no two tools may show one wire name. A broken rule is a `Failure::Rejected` whose text names the tool. The fake Host compares `parameters` as text, which is stricter than the Harness, which compares the JSON they hold. A render that lists the offered `ToolInfo` with another wire name or description passes both.
+
 ### Linked and library builds of one Plugin
 
 A Host can also link a Plugin crate in and pass `runvil_plugin_sdk::entry::<Acme>` to the Harness's `insert_plugin`, so no symbol is exported. Two linked Plugins that both export `runvil_plugin` cannot share one binary, so a crate built both ways puts `export_plugin!` behind a feature of its own, as `examples/hello-plugin` does with `dll`.
 
 ## Writing a Plugin in C or C++
 
-Include `runvil_plugin.h` and define `RvStatus runvil_plugin(RvCall *call)`. The header's opening comment is the whole contract: the verbs, who calls what on which thread, and what the Plugin must free on every path. The functions a Plugin may call back come with the verb they serve, in its arguments struct behind `call->args` (an `RvLoadArgs` for `RV_PLUGIN_LOAD`, an `RvPackNewArgs` for `RV_PACK_NEW`, an `RvToolCallArgs` for `RV_TOOL_CALL`), and each takes that struct's `ctx` first. A step of a tool call makes one file request through one of the nine file functions in its `RvToolCallArgs`, such as `file_read` or `file_write`, and returns `RV_PENDING`, and the call's next step finds the answer behind `answer` in its own `RvToolCallArgs`. A step that returns `RV_PENDING` without a file request parks its call, and the Host owes it no step until a wake. So such a step first calls `args->waker.wake(args->waker.ctx)` when it wants the next step right away, or a thread of the Plugin makes that call later, when what the tool call waits for is there. `wake` takes the `ctx` of its own `RvWaker` and not the step's, and it is the one function a Plugin may call on any thread, until `RV_PLUGIN_UNLOAD` returns. `resources` in the same `RvToolCallArgs` is the JSON text of what the Host offers every Plugin. `tests/c-layout` compiles the header as C99 and as C++ on every CI run.
+Include `runvil_plugin.h` and define `RvStatus runvil_plugin(RvCall *call)`. The header's opening comment is the whole contract: the verbs, who calls what on which thread, and what the Plugin must free on every path. The functions a Plugin may call back come with the verb they serve, in its arguments struct behind `call->args` (an `RvLoadArgs` for `RV_PLUGIN_LOAD`, an `RvPackNewArgs` for `RV_PACK_NEW`, an `RvToolCallArgs` for `RV_TOOL_CALL`), and each takes that struct's `ctx` first. A step of a tool call makes one file request through one of the nine file functions in its `RvToolCallArgs`, such as `file_read` or `file_write`, and returns `RV_PENDING`, and the call's next step finds the answer behind `answer` in its own `RvToolCallArgs`. A step that returns `RV_PENDING` without a file request parks its call, and the Host owes it no step until a wake. So such a step first calls `args->waker.wake(args->waker.ctx)` when it wants the next step right away, or a thread of the Plugin makes that call later, when what the tool call waits for is there. `wake` takes the `ctx` of its own `RvWaker` and not the step's, and it is the one function a Plugin may call on any thread, until `RV_PLUGIN_UNLOAD` returns. `resources` in the same `RvToolCallArgs` is the JSON text of what the Host offers every Plugin. A Plugin that shapes its tools for a model answers `RV_PACK_RENDER`: its `RvPackRenderArgs` holds the section entry in `entry`, the model as JSON text in `model`, the tools the section offered in `offered` and `offered_len`, and the functions `add_tool` and `refuse`. The Plugin calls `add_tool` once for each tool the model is shown and returns `RV_OK`. A Plugin that does not render answers `RV_ERR_UNSUPPORTED`, and the model is shown the offered tools as they are. `tests/c-layout` compiles the header as C99 and as C++ on every CI run.
 
 ## Versions
 
-The contract's version is `RV_API_MAJOR`.`RV_API_MINOR`, and `runvil-plugin-sys` has the same version number. While the major version is 0, each version is its own contract, so a Plugin built for 0.6 loads only in a Host that speaks exactly 0.6. From 1.0, minor versions only add, and a Plugin built for 1.n loads in any Host that speaks 1.n or later.
+The contract's version is `RV_API_MAJOR`.`RV_API_MINOR`, and `runvil-plugin-sys` has the same version number. While the major version is 0, each version is its own contract, so a Plugin built for 0.7 loads only in a Host that speaks exactly 0.7. From 1.0, minor versions only add, and a Plugin built for 1.n loads in any Host that speaks 1.n or later.
 
 Cargo allows one package per `links` value in a build, and `runvil-plugin-sys` sets `links = "runvil_plugin"`, so a Host can never link two versions of the contract into one binary.
 
