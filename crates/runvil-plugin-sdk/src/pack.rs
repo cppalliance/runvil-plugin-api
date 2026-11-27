@@ -4,6 +4,7 @@
 use std::future::Future;
 use std::pin::Pin;
 
+use crate::Refusal;
 use crate::tool::{ToolCall, ToolError, ToolInfo, ToolOutput};
 
 /// A boxed future that is `Send`, which [`Pack::call`] returns. An
@@ -104,6 +105,79 @@ pub trait Pack: Send + Sync + 'static {
     /// Returns a [`ToolError`], whose message a model reads, when the call
     /// rejects its arguments or fails.
     fn call<'a>(&'a self, call: ToolCall<'a>) -> BoxFuture<'a, Result<ToolOutput, ToolError>>;
+
+    /// Lists the tools a model is shown, given the tools a section
+    /// offered from this Pack. The Host calls it when a section entry's
+    /// first model round is about to advertise its tools, once for each of
+    /// the entry's two sets of tools that holds a tool of this Pack, with
+    /// the same [`RenderContext`] each time. What it lists stays fixed for
+    /// that section entry. The default lists `offered` as it came.
+    ///
+    /// `offered` holds the catalog tools of this Pack the section offered
+    /// in this set, as [`Pack::tools`] listed them. The answer decides
+    /// what the model sees:
+    ///
+    /// - A tool left out of the answer is not shown.
+    /// - A tool listed under the `name` of an offered tool is that catalog
+    ///   tool. It may take another `wire_name` and `description`, and its
+    ///   `parameters` stay the offered text, so one catalog name always
+    ///   means one parameter schema. Lua can call it by its id, whatever
+    ///   the model is shown.
+    /// - A tool listed under any other name is a model-facing tool: only a
+    ///   model calls it, and no script can name it. It is how a model is
+    ///   shown other parameters than the catalog's, under a name of its
+    ///   own, and [`Pack::call`] answers its calls by that name. It takes
+    ///   the flags it is given, so a model-facing tool that changes files
+    ///   says so with [`ToolInfo::changes_files`].
+    ///
+    /// It returns promptly: it does not block and does no I/O. It may
+    /// run on any thread and at the same time as calls of this instance.
+    /// A panic in it ends the render as a refusal and never unwinds into
+    /// the Host.
+    ///
+    /// # Errors
+    /// Returns a [`Refusal`], whose reason a model can read, when the Pack
+    /// cannot render for this model. The round that asked for the render
+    /// then fails.
+    fn render(
+        &self,
+        cx: &RenderContext<'_>,
+        offered: Vec<ToolInfo>,
+    ) -> Result<Vec<ToolInfo>, Refusal> {
+        let _ = cx;
+        Ok(offered)
+    }
+}
+
+/// What a [`Pack`] learns about the section entry it renders for, in
+/// [`Pack::render`].
+///
+/// A section entry is one execution of a section. The entry point builds
+/// the context from what the Host lends for the call, and a Pack keeps
+/// none of it past the call. A later version adds facts as new fields, so
+/// a Pack reads the fields it names and matches no other way.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RenderContext<'a> {
+    /// The section entry, the value a prompt's Lua reads as `sys.id`.
+    pub entry: &'a str,
+    /// The JSON text of an object that describes the model of the entry's
+    /// first round: `server`, `name`, `description`, `context` (the window
+    /// in tokens), `thinking` (`"never"`, `"always"`, or `"switchable"`),
+    /// and `provider` when the Host's catalog names one. The SDK needs no
+    /// JSON library, so a Pack parses it with one of its own. A later
+    /// version adds a fact as a new key, so a Pack ignores a key it does
+    /// not know.
+    pub model: &'a str,
+}
+
+impl<'a> RenderContext<'a> {
+    /// A context for the section entry `entry` and the model `model`, for
+    /// a Pack author who calls [`Pack::render`] in a test without a Host.
+    #[must_use]
+    pub fn new(entry: &'a str, model: &'a str) -> RenderContext<'a> {
+        RenderContext { entry, model }
+    }
 }
 
 /// One run's instance of a Pack as `call->pack_run` holds it: a thin

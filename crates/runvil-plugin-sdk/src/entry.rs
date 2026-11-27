@@ -15,7 +15,7 @@ use std::panic::{self, AssertUnwindSafe};
 use std::slice;
 
 use runvil_plugin_sys::{
-    RV_ERR_MISUSE, RV_ERR_UNSUPPORTED, RV_PACK_DELETE, RV_PACK_NEW, RV_PLUGIN_LOAD,
+    RV_ERR_MISUSE, RV_ERR_UNSUPPORTED, RV_PACK_DELETE, RV_PACK_NEW, RV_PACK_RENDER, RV_PLUGIN_LOAD,
     RV_PLUGIN_UNLOAD, RV_TOOL_CALL, RV_TOOL_CANCEL, RvCall, RvStatus, RvStr,
 };
 
@@ -42,6 +42,8 @@ use crate::{Plugin, Refusal};
 ///   [`Plugin::new_pack`] and adding each of its
 ///   [`tools`](crate::Pack::tools);
 /// - `RV_PACK_DELETE` by dropping that instance;
+/// - `RV_PACK_RENDER` by calling [`Pack::render`](crate::Pack::render)
+///   with the tools the section offered, and adding each tool it lists;
 /// - `RV_TOOL_CALL` by polling the future of
 ///   [`Pack::call`](crate::Pack::call) once, with the answer to its file
 ///   request at hand and a waker over the Host's waker for the call, and
@@ -83,6 +85,7 @@ pub unsafe extern "C" fn entry<P: Plugin>(call: *mut RvCall) -> RvStatus {
             RV_PLUGIN_UNLOAD => plugin::unload::<P>(call),
             RV_PACK_NEW => pack::new::<P>(call),
             RV_PACK_DELETE => pack::delete(call),
+            RV_PACK_RENDER => pack::render(call),
             RV_TOOL_CALL => tool::step(call),
             RV_TOOL_CANCEL => tool::cancel(call),
             _ => RV_ERR_UNSUPPORTED,

@@ -127,7 +127,7 @@ mod tool;
 
 pub use entry::entry;
 pub use file::{DirEntry, FileError, FileErrorKind, FileFuture, FileType, Stat};
-pub use pack::{BoxFuture, Pack, PackInfo};
+pub use pack::{BoxFuture, Pack, PackInfo, RenderContext};
 pub use runvil_plugin_sys as sys;
 pub use tool::{NextStep, ToolCall, ToolError, ToolErrorKind, ToolInfo, ToolOutput, next_step};
 
