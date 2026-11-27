@@ -27,13 +27,13 @@ mod tests {
         RV_FILE_ERROR_NOT_EMPTY, RV_FILE_ERROR_NOT_FOUND, RV_FILE_ERROR_OTHER,
         RV_FILE_TYPE_DIRECTORY, RV_FILE_TYPE_FILE, RV_FILE_TYPE_OTHER, RV_FILE_TYPE_SYMLINK,
         RV_MAX_LINE, RV_MAX_NAME, RV_MAX_PATH, RV_MAX_RESULT, RV_MAX_TOOL_TEXT, RV_MAX_WRITE,
-        RV_OK, RV_PACK_DELETE, RV_PACK_NEW, RV_PENDING, RV_PLUGIN_LOAD, RV_PLUGIN_UNLOAD,
-        RV_RESULT_BACKEND, RV_RESULT_INVALID_ARGUMENTS, RV_RESULT_OTHER, RV_RESULT_TRANSPORT,
-        RV_RESULT_TRUSTED, RV_RESULT_UNTRUSTED, RV_TOOL_CALL, RV_TOOL_CANCEL,
+        RV_OK, RV_PACK_DELETE, RV_PACK_NEW, RV_PACK_RENDER, RV_PENDING, RV_PLUGIN_LOAD,
+        RV_PLUGIN_UNLOAD, RV_RESULT_BACKEND, RV_RESULT_INVALID_ARGUMENTS, RV_RESULT_OTHER,
+        RV_RESULT_TRANSPORT, RV_RESULT_TRUSTED, RV_RESULT_UNTRUSTED, RV_TOOL_CALL, RV_TOOL_CANCEL,
         RV_TOOL_CHANGES_FILES, RvBytes, RvCall, RvDirEntries, RvDirEntry, RvFileAnswer,
         RvFileError, RvFileErrorKind, RvFileType, RvHost, RvLoadArgs, RvPackInfo, RvPackNewArgs,
-        RvPluginInfo, RvResultKind, RvStat, RvStatus, RvStr, RvToolCallArgs, RvToolFlags,
-        RvToolInfo, RvToolResult, RvVerb, RvWaker,
+        RvPackRenderArgs, RvPluginInfo, RvResultKind, RvStat, RvStatus, RvStr, RvToolCallArgs,
+        RvToolFlags, RvToolInfo, RvToolResult, RvVerb, RvWaker,
     };
 
     /// One entry of the table in `layout.c`.
@@ -50,6 +50,10 @@ mod tests {
         fn runvil_plugin(call: *mut RvCall) -> RvStatus;
         /// `sizeof(RvCall)` as C++ sees it.
         safe fn rv_cpp_size_of_call() -> usize;
+        /// sizeof(RvPackRenderArgs) as C++ sees it.
+        safe fn rv_cpp_size_of_pack_render_args() -> usize;
+        /// offsetof(RvPackRenderArgs, add_tool) as C++ sees it.
+        safe fn rv_cpp_offset_of_pack_render_add_tool() -> usize;
         /// `runvil_plugin` as C++ names it.
         safe fn rv_cpp_entry() -> unsafe extern "C" fn(*mut RvCall) -> RvStatus;
     }
@@ -196,6 +200,16 @@ mod tests {
             offset!(RvPackNewArgs, pack),
             offset!(RvPackNewArgs, refuse),
             offset!(RvPackNewArgs, add_tool),
+            size!(RvPackRenderArgs),
+            offset!(RvPackRenderArgs, size),
+            offset!(RvPackRenderArgs, reserved),
+            offset!(RvPackRenderArgs, ctx),
+            offset!(RvPackRenderArgs, entry),
+            offset!(RvPackRenderArgs, model),
+            offset!(RvPackRenderArgs, offered),
+            offset!(RvPackRenderArgs, offered_len),
+            offset!(RvPackRenderArgs, refuse),
+            offset!(RvPackRenderArgs, add_tool),
             size!(RvWaker),
             offset!(RvWaker, ctx),
             offset!(RvWaker, wake),
@@ -244,6 +258,7 @@ mod tests {
             value!(RV_PACK_DELETE),
             value!(RV_TOOL_CALL),
             value!(RV_TOOL_CANCEL),
+            value!(RV_PACK_RENDER),
             value!(RV_RESULT_UNTRUSTED),
             value!(RV_RESULT_TRUSTED),
             value!(RV_RESULT_INVALID_ARGUMENTS),
@@ -285,6 +300,18 @@ mod tests {
         // SAFETY: the C entry point never reads its argument.
         let status = unsafe { runvil_plugin(ptr::null_mut()) };
         assert_eq!(status, RV_ERR_UNSUPPORTED);
+    }
+
+    #[test]
+    fn cpp_sees_the_same_render_arguments_as_rust() {
+        assert_eq!(
+            rv_cpp_size_of_pack_render_args(),
+            size_of::<RvPackRenderArgs>()
+        );
+        assert_eq!(
+            rv_cpp_offset_of_pack_render_add_tool(),
+            offset_of!(RvPackRenderArgs, add_tool)
+        );
     }
 
     #[test]

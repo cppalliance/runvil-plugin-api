@@ -49,6 +49,10 @@
 //!   tool call on `call->pack_run`.
 //! - [`RV_TOOL_CANCEL`] (6), with no arguments: frees `call->tool_call`,
 //!   the state of a tool call the Host has abandoned.
+//! - [`RV_PACK_RENDER`] (7), with an [`RvPackRenderArgs`]: lends one run's
+//!   instance of a Pack the tools a section offered from it and the model
+//!   that will read them, and lists the tools the model is shown, with
+//!   `add_tool`.
 //!
 //! A Plugin answers a verb it does not know with [`RV_ERR_UNSUPPORTED`].
 //! [`RV_PLUGIN_UNLOAD`], [`RV_PACK_DELETE`], and [`RV_TOOL_CANCEL`] return
@@ -60,13 +64,70 @@
 //!   makes one instance of a Pack for each run that holds the Pack, with
 //!   [`RV_PACK_NEW`], and frees the instance with [`RV_PACK_DELETE`] when
 //!   the run ends.
-//! - An instance's tools are the ones it adds during [`RV_PACK_NEW`], and
-//!   they stay fixed for the run. The Host forms each tool's id from the
+//! - An instance's catalog tools are the ones it adds during
+//!   [`RV_PACK_NEW`], and they stay fixed for the run. A render may list
+//!   other tools for a model, as the section on renders says. The Host
+//!   forms each tool's id from the
 //!   Pack's id, which is the second segment of the Pack's name, and the
 //!   tool's name: the tool `fetch` of the Pack `acme/url` is `url/fetch`.
 //! - [`RV_PACK_NEW`] runs while the Host prepares a run, so it returns
 //!   promptly: it does not block and does no I/O. What is costly to make
 //!   belongs in the Plugin instance, which every run shares.
+//!
+//! # Renders
+//!
+//! - A tool a Pack lists in [`RV_PACK_NEW`] is a catalog tool: the Host's
+//!   scripts call it by its id, a prompt offers it by that id, and its
+//!   parameters are the same for the whole run. A tool that only a render
+//!   lists is a model-facing tool: only a model calls it, and no script
+//!   can name it.
+//! - When a section entry's first model round is about to advertise its
+//!   tools, the Host sends [`RV_PACK_RENDER`] to the instance of each Pack
+//!   the section offered tools from, so that the Pack can shape what the
+//!   model sees for that model. The Host sends it once for each of the
+//!   section's two sets of tools that holds a tool of the Pack, so up to
+//!   twice for one section entry, with the same `entry` and `model`. What
+//!   the Pack lists stays fixed for that section entry.
+//! - `entry` is the section entry, the value a prompt's Lua reads as
+//!   `sys.id`. `model` is the JSON text of an object that describes the
+//!   model of the entry's first round, with the keys `server`, `name`,
+//!   `description`, `context` (the window in tokens), and `thinking`
+//!   (`"never"`, `"always"`, or `"switchable"`), and `provider` when the
+//!   Host's catalog names one. A model the Host's catalog does not hold
+//!   reports `"never"`. A later version adds a fact as a new key, so a
+//!   Plugin ignores a key it does not know.
+//! - `offered` points at `offered_len` [`RvToolInfo`] values, one for each
+//!   tool the section offered from this Pack in this set, in the order
+//!   they were offered. Each `name` is the tool's name within its Pack.
+//!   `wire_name` is empty when the Host derives the name. `description`
+//!   and `parameters` are the catalog's, and `parameters` is the Host's
+//!   own text of the schema, so its spacing and key order can differ from
+//!   the text the Plugin gave [`RV_PACK_NEW`]. `flags` are the catalog's.
+//! - The Plugin answers by calling `add_tool` once for each tool the model
+//!   is shown, in the order it is shown, and returning [`RV_OK`]. A tool
+//!   the Plugin leaves out is one the model is not shown. Each tool it
+//!   adds is checked as [`RV_PACK_NEW`] checks a tool.
+//! - A tool added under the `name` of an offered tool is that catalog
+//!   tool. It may change its `wire_name` and `description`, and its
+//!   `parameters` must be those the Host lent, so a catalog tool's name
+//!   always means one parameter schema. A tool added under any other name
+//!   is a model-facing tool, with the `flags` the Plugin gives it, such
+//!   as [`RV_TOOL_CHANGES_FILES`]. A model-facing tool is the way to show
+//!   a model other parameters than the catalog's: the Plugin lists it
+//!   under a name of its own and answers its calls by that name. A name
+//!   that is a catalog tool of the run which the section did not offer in
+//!   this set is not free for a model-facing tool: the Host fails the
+//!   round that asked for the render.
+//! - A Plugin that does not render answers [`RV_ERR_UNSUPPORTED`], and the
+//!   Host shows the model the offered tools as they are. A Plugin that
+//!   cannot render declines with `refuse`, which returns
+//!   [`RV_ERR_REFUSED`], at most once, with a UTF-8 reason of at most
+//!   [`RV_MAX_LINE`] bytes. A refusal, a misuse, and any other status
+//!   fail the render, and the round that asked for it fails with it.
+//! - [`RV_PACK_RENDER`] returns promptly: it does not block and does no
+//!   I/O. It keeps nothing: `entry`, `model`, and `offered` are valid for
+//!   the call only, every tool it lists is copied by the Host as it is
+//!   added, and there is nothing for the Plugin to free.
 //!
 //! # Tool calls
 //!
@@ -176,8 +237,10 @@
 //! - Calls may run at the same time on different threads, with three
 //!   exceptions. No two steps of one tool call run at the same time, and
 //!   [`RV_TOOL_CANCEL`] runs beside no step of its call.
-//!   [`RV_PACK_DELETE`] comes after every tool call of its
-//!   `pack_run` has ended, and runs beside no call that names it.
+//!   [`RV_PACK_DELETE`] comes after every tool call and every render of
+//!   its `pack_run` has ended, and runs beside no call that names it. So
+//!   [`RV_PACK_RENDER`] may run beside tool calls of its `pack_run` and
+//!   beside another render of it.
 //!   [`RV_PLUGIN_UNLOAD`] comes after every Pack instance of the Plugin is
 //!   deleted, and runs beside no other call.
 //! - The functions in a verb's arguments struct answer only while that
@@ -220,6 +283,9 @@
 //!   refusal, a misuse, or a status other than [`RV_OK`]. The Plugin frees
 //!   whatever it made before it returns on every such path. One that
 //!   succeeds gets exactly one [`RV_PACK_DELETE`].
+//! - An [`RV_PACK_RENDER`] leaves the instance as it was, whether it
+//!   succeeds, is refused, or is rejected, so it gets no later verb. The
+//!   Plugin frees whatever it made during the call before it returns.
 //! - The step that ends a tool call frees the call's state before it
 //!   returns. A call that is abandoned gets [`RV_TOOL_CANCEL`] instead,
 //!   which frees the state; its `call->tool_call` is NULL when no step set
@@ -229,20 +295,21 @@
 //!
 //! # Reserved numbers
 //!
-//! Verbs 7 and 8 and status codes 1 to 3 are reserved for later versions,
-//! so those numbers never get another meaning. This version declares no
-//! constant for them, sends neither verb, and returns none of those codes.
+//! Verb 8 and status codes 1 to 3 are reserved for later versions, so
+//! those numbers never get another meaning. This version declares no
+//! constant for them, sends no such verb, and returns none of those codes.
 //!
 //! # Status codes
 //!
 //! - [`RV_OK`] (0) is success.
 //! - Codes 1 to 3 are reserved.
 //! - [`RV_ERR_MISUSE`] (4) means the caller broke the contract.
-//! - [`RV_ERR_REFUSED`] (5) means the Plugin declined: to load, or to make
-//!   a Pack instance.
+//! - [`RV_ERR_REFUSED`] (5) means the Plugin declined: to load, to make a
+//!   Pack instance, or to render a Pack's tools.
 //! - [`RV_ERR_UNSUPPORTED`] (6) means the Plugin cannot answer the call: it
-//!   does not know the verb, the Host reports a version the Plugin was not
-//!   built for, or a struct's `size` is smaller than the Plugin expects.
+//!   does not know the verb, does not render for [`RV_PACK_RENDER`], the
+//!   Host reports a version the Plugin was not built for, or a struct's
+//!   `size` is smaller than the Plugin expects.
 //! - [`RV_PENDING`] (7) means a tool call is parked: the Host sends its
 //!   next step after the Plugin wakes the call, or when the answer to the
 //!   step's file request is ready. Only [`RV_TOOL_CALL`] returns it.
@@ -295,8 +362,8 @@ pub type RvStatus = u32;
 pub const RV_OK: RvStatus = 0;
 /// The caller broke the contract.
 pub const RV_ERR_MISUSE: RvStatus = 4;
-/// The Plugin declined to load or to make a Pack instance; `refuse`
-/// returns it.
+/// The Plugin declined to load, to make a Pack instance, or to render a
+/// Pack's tools; `refuse` returns it.
 pub const RV_ERR_REFUSED: RvStatus = 5;
 /// The Plugin cannot answer the call: it does not know the verb, it was
 /// not built for the Host's version, or a struct is shorter than it
@@ -328,6 +395,9 @@ pub const RV_PACK_DELETE: RvVerb = 4;
 pub const RV_TOOL_CALL: RvVerb = 5;
 /// Free the state of a tool call the Host has abandoned.
 pub const RV_TOOL_CANCEL: RvVerb = 6;
+/// Lend a Pack instance the tools a section offered from it and the model
+/// that will read them, and list the tools the model is shown.
+pub const RV_PACK_RENDER: RvVerb = 7;
 
 /// How a tool call ended, in an [`RvToolResult`]. A fixed-width integer,
 /// as [`RvVerb`] is.
@@ -398,7 +468,7 @@ pub const RV_TOOL_CHANGES_FILES: RvToolFlags = 1;
 /// The contract's major version, which [`RvHost`] reports.
 pub const RV_API_MAJOR: u32 = 0;
 /// The contract's minor version, which [`RvHost`] reports.
-pub const RV_API_MINOR: u32 = 6;
+pub const RV_API_MINOR: u32 = 7;
 
 /// The most bytes in a name segment, a version, or a wire name.
 pub const RV_MAX_NAME: usize = 64;
@@ -635,6 +705,40 @@ pub struct RvPackNewArgs {
     pub add_tool: unsafe extern "C" fn(ctx: *mut c_void, info: *const RvToolInfo) -> RvStatus,
 }
 
+/// The arguments of [`RV_PACK_RENDER`]: the section entry, the model, the
+/// tools the section offered from the Pack, and the functions the Plugin
+/// may call while it renders, each taking `ctx` first.
+#[repr(C)]
+#[derive(Debug)]
+pub struct RvPackRenderArgs {
+    /// The size of this struct in bytes: `sizeof(RvPackRenderArgs)`.
+    pub size: u32,
+    /// Zero.
+    pub reserved: u32,
+    /// The Host's context for this call, passed back as the first argument
+    /// of each function below. The Plugin never reads through it.
+    pub ctx: *mut c_void,
+    /// The section entry, the value a prompt's Lua reads as `sys.id`.
+    pub entry: RvStr,
+    /// The JSON text of an object that describes the model of the entry's
+    /// first round: `server`, `name`, `description`, `context`, `thinking`,
+    /// and `provider` when the Host's catalog names one.
+    pub model: RvStr,
+    /// The first of `offered_len` tools the section offered from this Pack
+    /// in this set, in the order they were offered. It may be NULL when
+    /// `offered_len` is zero.
+    pub offered: *const RvToolInfo,
+    /// How many tools `offered` points at.
+    pub offered_len: usize,
+    /// Declines to render, at most once, with a UTF-8 reason of at most
+    /// [`RV_MAX_LINE`] bytes that a model can read; returns
+    /// [`RV_ERR_REFUSED`]. The round that asked for the render fails.
+    pub refuse: unsafe extern "C" fn(ctx: *mut c_void, reason: RvStr) -> RvStatus,
+    /// Adds one tool the model is shown, once for each, in the order the
+    /// model sees them. No two tools of one render share a name.
+    pub add_tool: unsafe extern "C" fn(ctx: *mut c_void, info: *const RvToolInfo) -> RvStatus,
+}
+
 /// Wakes one tool call. The Plugin may call `wake` from any thread, any
 /// number of times, from the call's first step until
 /// [`RV_PLUGIN_UNLOAD`] returns. The Host keeps what `ctx` points at
@@ -745,11 +849,13 @@ pub struct RvCall {
     pub plugin: *mut c_void,
     /// One run's instance of a Pack: NULL going into [`RV_PACK_NEW`],
     /// which sets it, that pointer on [`RV_PACK_DELETE`],
-    /// [`RV_TOOL_CALL`], and [`RV_TOOL_CANCEL`], and NULL otherwise.
+    /// [`RV_PACK_RENDER`], [`RV_TOOL_CALL`], and [`RV_TOOL_CANCEL`], and
+    /// NULL otherwise.
     pub pack_run: *mut c_void,
     /// The verb's own arguments: an [`RvLoadArgs`] for [`RV_PLUGIN_LOAD`],
-    /// an [`RvPackNewArgs`] for [`RV_PACK_NEW`], an [`RvToolCallArgs`] for
-    /// [`RV_TOOL_CALL`], and NULL for every other verb.
+    /// an [`RvPackNewArgs`] for [`RV_PACK_NEW`], an [`RvPackRenderArgs`]
+    /// for [`RV_PACK_RENDER`], an [`RvToolCallArgs`] for [`RV_TOOL_CALL`],
+    /// and NULL for every other verb.
     pub args: *const c_void,
     /// The state of one tool call: NULL going into the call's first
     /// [`RV_TOOL_CALL`], what the last step left on each later step and on
@@ -779,16 +885,16 @@ mod tests {
         RV_FILE_ERROR_NOT_EMPTY, RV_FILE_ERROR_NOT_FOUND, RV_FILE_ERROR_OTHER,
         RV_FILE_TYPE_DIRECTORY, RV_FILE_TYPE_FILE, RV_FILE_TYPE_OTHER, RV_FILE_TYPE_SYMLINK,
         RV_MAX_LINE, RV_MAX_NAME, RV_MAX_PATH, RV_MAX_RESULT, RV_MAX_TOOL_TEXT, RV_MAX_WRITE,
-        RV_OK, RV_PACK_DELETE, RV_PACK_NEW, RV_PENDING, RV_PLUGIN_LOAD, RV_PLUGIN_UNLOAD,
-        RV_RESULT_BACKEND, RV_RESULT_INVALID_ARGUMENTS, RV_RESULT_OTHER, RV_RESULT_TRANSPORT,
-        RV_RESULT_TRUSTED, RV_RESULT_UNTRUSTED, RV_TOOL_CALL, RV_TOOL_CANCEL,
+        RV_OK, RV_PACK_DELETE, RV_PACK_NEW, RV_PACK_RENDER, RV_PENDING, RV_PLUGIN_LOAD,
+        RV_PLUGIN_UNLOAD, RV_RESULT_BACKEND, RV_RESULT_INVALID_ARGUMENTS, RV_RESULT_OTHER,
+        RV_RESULT_TRANSPORT, RV_RESULT_TRUSTED, RV_RESULT_UNTRUSTED, RV_TOOL_CALL, RV_TOOL_CANCEL,
         RV_TOOL_CHANGES_FILES,
     };
     #[cfg(target_pointer_width = "64")]
     use super::{
         RvBytes, RvCall, RvDirEntries, RvDirEntry, RvFileAnswer, RvFileError, RvHost, RvLoadArgs,
-        RvPackInfo, RvPackNewArgs, RvPluginInfo, RvStat, RvStr, RvToolCallArgs, RvToolInfo,
-        RvToolResult, RvWaker,
+        RvPackInfo, RvPackNewArgs, RvPackRenderArgs, RvPluginInfo, RvStat, RvStr, RvToolCallArgs,
+        RvToolInfo, RvToolResult, RvWaker,
     };
 
     #[test]
@@ -914,6 +1020,21 @@ mod tests {
 
     #[test]
     #[cfg(target_pointer_width = "64")]
+    fn the_pack_render_arguments_keep_their_layout() {
+        assert_eq!(size_of::<RvPackRenderArgs>(), 80);
+        assert_eq!(offset_of!(RvPackRenderArgs, size), 0);
+        assert_eq!(offset_of!(RvPackRenderArgs, reserved), 4);
+        assert_eq!(offset_of!(RvPackRenderArgs, ctx), 8);
+        assert_eq!(offset_of!(RvPackRenderArgs, entry), 16);
+        assert_eq!(offset_of!(RvPackRenderArgs, model), 32);
+        assert_eq!(offset_of!(RvPackRenderArgs, offered), 48);
+        assert_eq!(offset_of!(RvPackRenderArgs, offered_len), 56);
+        assert_eq!(offset_of!(RvPackRenderArgs, refuse), 64);
+        assert_eq!(offset_of!(RvPackRenderArgs, add_tool), 72);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
     fn the_waker_keeps_its_layout() {
         assert_eq!(size_of::<RvWaker>(), 16);
         assert_eq!(offset_of!(RvWaker, ctx), 0);
@@ -1007,6 +1128,7 @@ mod tests {
         assert_eq!(RV_PACK_DELETE, 4);
         assert_eq!(RV_TOOL_CALL, 5);
         assert_eq!(RV_TOOL_CANCEL, 6);
+        assert_eq!(RV_PACK_RENDER, 7);
     }
 
     #[test]
